@@ -606,32 +606,23 @@ export async function magentoControllerRouteEdges(
   return edges;
 }
 
+
 /**
- * `.phtml` template → the block and view-model methods it calls.
- *
- * A template's `$block->getFoo()` names a method on a class the template never
- * mentions: layout XML supplies it. Both halves are known here — the layout
- * block node references its class and its template — so the callsites can be
- * bound to real methods, giving the block class its callers and the template
- * its data source.
+ * Template file → the classes layout XML binds to it (the block class plus any
+ * view models). This is what makes a template's `$block->getFoo()` resolvable,
+ * and it is shared with the MageObsidian passes because a Twig template is
+ * bound by exactly the same layout XML.
  */
-const BLOCK_CALL_RE = /\$(block|viewModel|view_model)\s*->\s*(\w+)\s*\(/g;
-
-export async function magentoTemplateEdges(
-  queries: MagentoQueries,
+export async function templateClassBindings(
   context: ResolutionContext,
+  templates: Map<string, string>,
   onYield: MaybeYield,
-): Promise<Edge[]> {
-  const { modules, config, templates } = getMagentoProject(context);
-  if (modules.size === 0) return [];
-
+): Promise<Map<string, Set<string>>> {
   const layoutFiles = new Set<string>();
   for (const block of iterateKind(context, 'component')) {
     if (block.id.startsWith('magento-block:')) layoutFiles.add(block.filePath);
   }
-  if (layoutFiles.size === 0) return [];
 
-  // template path → the classes layout XML binds to it (block class + view models).
   const boundClasses = new Map<string, Set<string>>();
   for (const layoutPath of layoutFiles) {
     await onYield();
@@ -665,6 +656,30 @@ export async function magentoTemplateEdges(
       }
     }
   }
+
+  return boundClasses;
+}
+
+/**
+ * `.phtml` template → the block and view-model methods it calls.
+ *
+ * A template's `$block->getFoo()` names a method on a class the template never
+ * mentions: layout XML supplies it. Both halves are known here — the layout
+ * block node references its class and its template — so the callsites can be
+ * bound to real methods, giving the block class its callers and the template
+ * its data source.
+ */
+const BLOCK_CALL_RE = /\$(block|viewModel|view_model)\s*->\s*(\w+)\s*\(/g;
+
+export async function magentoTemplateEdges(
+  queries: MagentoQueries,
+  context: ResolutionContext,
+  onYield: MaybeYield,
+): Promise<Edge[]> {
+  const { modules, config, templates } = getMagentoProject(context);
+  if (modules.size === 0) return [];
+
+  const boundClasses = await templateClassBindings(context, templates, onYield);
   if (boundClasses.size === 0) return [];
 
   const edges: Edge[] = [];

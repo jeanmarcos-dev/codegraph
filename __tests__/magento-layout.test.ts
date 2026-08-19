@@ -161,3 +161,24 @@ describe('extractUiComponent', () => {
     expect(references).toHaveLength(0);
   });
 });
+
+describe('twig templates', () => {
+  const modules = new Map([['MageObsidian_Storefront', 'app/code/MageObsidian/Storefront']]);
+
+  it('resolves a .twig template the same way as a .phtml one', () => {
+    const files = ['app/code/MageObsidian/Storefront/view/frontend/templates/header.twig'];
+    expect(resolveTemplatePath('MageObsidian_Storefront::header.twig', modules, files)).toBe(
+      files[0],
+    );
+  });
+
+  it('prefers a theme override of a twig template', () => {
+    const files = [
+      'app/code/MageObsidian/Storefront/view/frontend/templates/header.twig',
+      'app/design/frontend/MageObsidian/default/MageObsidian_Storefront/templates/header.twig',
+    ];
+    expect(resolveTemplatePath('MageObsidian_Storefront::header.twig', modules, files)).toBe(
+      files[1],
+    );
+  });
+});

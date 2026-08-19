@@ -146,6 +146,12 @@ export function extractLayout(filePath: string, content: string): XmlExtraction 
 /** `Vendor_Module::path/file.phtml` → the indexed file that renders it. */
 export type TemplateIndex = Map<string, string>;
 
+/**
+ * `.twig` is here because MageObsidian registers a Twig engine alongside
+ * `.phtml`; a module or theme running it declares its templates the same way.
+ */
+const TEMPLATE_EXTENSIONS = ['.phtml', '.twig'];
+
 const THEME_TEMPLATE_RE = /^app\/design\/[^/]+\/[^/]+\/[^/]+\/(\w+_\w+)\/templates\/(.+)$/;
 const MODULE_TEMPLATE_RE = /^view\/[^/]+\/templates\/(.+)$/;
 
@@ -166,7 +172,7 @@ export function buildTemplateIndex(
   const overrides = new Set<string>();
 
   for (const filePath of files) {
-    if (!filePath.endsWith('.phtml')) continue;
+    if (!TEMPLATE_EXTENSIONS.some((ext) => filePath.endsWith(ext))) continue;
 
     const theme = filePath.match(THEME_TEMPLATE_RE);
     if (theme) {
