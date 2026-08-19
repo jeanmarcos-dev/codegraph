@@ -432,6 +432,8 @@ function collectIncludedFiles(
   const out = new Set<string>();
   const defaults = defaultsOnlyIgnore();
   const visited = new Set<string>();
+  /** Directory symlinks, replayed after the walk — see `scanDirectoryWalk`. */
+  const deferredLinks: { abs: string; rel: string }[] = [];
 
   const consider = (abs: string, rel: string, isDir: boolean): void => {
     if (isDir) {
@@ -475,7 +477,8 @@ function collectIncludedFiles(
       if (entry.isSymbolicLink()) {
         try {
           const st = fs.statSync(fs.realpathSync(abs));
-          consider(abs, rel, st.isDirectory());
+          if (st.isDirectory()) deferredLinks.push({ abs, rel });
+          else consider(abs, rel, false);
         } catch {
           // broken symlink — skip
         }
@@ -487,6 +490,10 @@ function collectIncludedFiles(
 
   for (const root of roots) {
     walk(root === '' ? rootDir : path.join(rootDir, root));
+  }
+  for (let i = 0; i < deferredLinks.length; i++) {
+    const link = deferredLinks[i]!;
+    consider(link.abs, link.rel, true);
   }
   return out;
 }
@@ -1289,6 +1296,9 @@ function scanDirectoryWalk(
     return patterns ? { dir, ig: ignore().add(patterns) } : null;
   };
 
+  /** Directory symlinks, replayed after the walk so a real path always wins. */
+  const deferredLinks: { dir: string; matchers: ScopedIgnore[] }[] = [];
+
   const isIgnored = (fullPath: string, isDir: boolean, matchers: ScopedIgnore[]): boolean => {
     for (const { dir, ig } of matchers) {
       let rel = normalizePath(path.relative(dir, fullPath));
@@ -1342,7 +1352,7 @@ function scanDirectoryWalk(
           const stat = fs.statSync(realTarget);
           if (stat.isDirectory()) {
             if (!isIgnored(fullPath, true, active)) {
-              walk(fullPath, active);
+              deferredLinks.push({ dir: fullPath, matchers: active });
             }
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
@@ -1380,6 +1390,16 @@ function scanDirectoryWalk(
   const exclude = loadExcludeMatcher(rootDir);
   if (exclude) baseMatchers.push({ dir: rootDir, ig: exclude });
   walk(rootDir, baseMatchers);
+
+  // Real directories first, symlinked ones after: `walk` claims a target by
+  // realpath, so whichever name reaches it first is the name its files are
+  // indexed under, and readdir order used to decide that. A link is still
+  // followed when nothing else reached its target — it points outside the root
+  // (#935), or the target is ignored where it really lives.
+  for (let i = 0; i < deferredLinks.length; i++) {
+    const link = deferredLinks[i]!;
+    walk(link.dir, link.matchers);
+  }
 
   // Force-include first-party source whitelisted in `codegraph.json` `include`
   // — the walk above honours `.gitignore`, so anything gitignored was dropped;

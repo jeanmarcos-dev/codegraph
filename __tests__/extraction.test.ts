@@ -7058,6 +7058,80 @@ describe('Directory Exclusion', () => {
   });
 });
 
+/**
+ * A directory symlink pointing back into the indexed tree gives the same files
+ * two names. The walk claims a target by realpath, so only one name survives —
+ * and it must be the real one, or the index keys itself to a path that is not
+ * where the code lives. Layouts that rotate such a link between sibling
+ * checkouts (a `current` pointer) otherwise re-aim every indexed path at a
+ * different tree without anything failing.
+ */
+describe('Directory Symlinks', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  const write = (relative: string, content: string): void => {
+    const full = path.join(tempDir, relative);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  };
+
+  const posix = it.runIf(process.platform !== 'win32');
+
+  posix('indexes a linked tree under its real path, not the link', () => {
+    write('workspaces/main/src/app.ts', 'export const x = 1;');
+    // Named to sort before `workspaces`, so winning cannot be readdir luck.
+    fs.symlinkSync('workspaces/main', path.join(tempDir, 'aaa_current'));
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toEqual(['workspaces/main/src/app.ts']);
+  });
+
+  posix('gives every sibling checkout its own real path', () => {
+    write('workspaces/main/src/app.ts', 'export const x = 1;');
+    write('workspaces/spike/src/app.ts', 'export const x = 2;');
+    fs.symlinkSync('workspaces/spike', path.join(tempDir, 'current'));
+
+    const files = scanDirectory(tempDir).sort();
+
+    expect(files).toEqual(['workspaces/main/src/app.ts', 'workspaces/spike/src/app.ts']);
+  });
+
+  posix('still follows a link whose target is outside the root (#935)', () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-outside-'));
+    try {
+      fs.mkdirSync(path.join(outside, 'src'));
+      fs.writeFileSync(path.join(outside, 'src', 'lib.ts'), 'export const y = 1;');
+      write('src/app.ts', 'export const x = 1;');
+      fs.symlinkSync(outside, path.join(tempDir, 'linked'));
+
+      const files = scanDirectory(tempDir).sort();
+
+      expect(files).toEqual(['linked/src/lib.ts', 'src/app.ts']);
+    } finally {
+      cleanupTempDir(outside);
+    }
+  });
+
+  posix('still follows a link whose target is ignored where it really lives', () => {
+    write('.gitignore', 'workspaces/\n');
+    write('workspaces/main/src/app.ts', 'export const x = 1;');
+    fs.symlinkSync('workspaces/main', path.join(tempDir, 'current'));
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toEqual(['current/src/app.ts']);
+  });
+});
+
 describe('Git Submodules', () => {
   let tempDir: string;
 
