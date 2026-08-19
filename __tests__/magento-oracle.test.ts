@@ -21,7 +21,12 @@ import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { describe, it, expect } from 'vitest';
 import { discoverModules, sortModules } from '../src/resolution/frameworks/magento/modules';
-import { buildDiConfig, resolvePreference, pluginsFor } from '../src/resolution/frameworks/magento/di';
+import {
+  buildDiConfig,
+  resolvePreference,
+  pluginsFor,
+  pluginInheritance,
+} from '../src/resolution/frameworks/magento/di';
 import type { ResolutionContext } from '../src/resolution/types';
 
 const ORACLE_ROOT = process.env.CODEGRAPH_MAGENTO_ORACLE;
@@ -96,6 +101,78 @@ const normalize = (name: string | null | undefined): string => (name ?? '').repl
  */
 const stripInterceptor = (name: string | null | undefined): string =>
   normalize(name).replace(/\\Interceptor$/, '');
+
+/**
+ * The class hierarchy, read straight from the source tree.
+ *
+ * Interception walks a type's ancestors, so measuring inherited plugins needs
+ * the parent chain and nothing else. Composer's generated PSR-4 map places a
+ * class in a file exactly, and the declaration always sits in the first few KB,
+ * so a targeted read of the ~1k types the oracle names is enough — no parser,
+ * and no walk of the 76k PHP files in `vendor/`.
+ */
+function hierarchyFor(root: string): (type: string) => string[] {
+  const psr4 = readPhpArray(
+    `$m = require ${JSON.stringify(path.join(root, 'vendor/composer/autoload_psr4.php'))}; echo json_encode($m);`,
+  ) as Record<string, string[]>;
+  // Longest prefix first: `Magento\Catalog\` must beat a bare `Magento\`.
+  const prefixes = Object.entries(psr4).sort((a, b) => b[0].length - a[0].length);
+  const cache = new Map<string, string[]>();
+
+  const fileOf = (fqcn: string): string | null => {
+    for (const [prefix, dirs] of prefixes) {
+      if (!fqcn.startsWith(prefix)) continue;
+      const tail = fqcn.slice(prefix.length).replace(/\\/g, '/') + '.php';
+      for (const dir of dirs) {
+        const candidate = path.join(dir, tail);
+        if (fs.existsSync(candidate)) return candidate;
+      }
+    }
+    return null;
+  };
+
+  // Terminates on `{`, never on end of line: an implements list routinely spans
+  // several lines, and stopping at the first newline drops every interface
+  // after the first — along with all their plugins.
+  const DECLARATION =
+    /^[ \t]*(?:(?:final|abstract)[ \t]+)?(?:class|interface|trait)[ \t]+\w+(?:\s+extends\s+([^{]+?))?(?:\s+implements\s+([^{]+?))?\s*\{/m;
+
+  const parse = (source: string, fqcn: string): string[] => {
+    const declaration = DECLARATION.exec(source);
+    if (!declaration) return [];
+    const namespace = /^\s*namespace\s+([^\s;{]+)/m.exec(source)?.[1] ?? '';
+    const uses = new Map<string, string>();
+    for (const [, target, alias] of source.matchAll(/^\s*use\s+([^\s;(]+?)(?:\s+as\s+(\w+))?\s*;/gim)) {
+      const full = normalize(target);
+      if (!full || /^(function|const)\s/i.test(target)) continue;
+      uses.set(alias ?? full.split('\\').pop()!, full);
+    }
+    const resolve = (name: string): string | null => {
+      const trimmed = name.trim();
+      if (!trimmed) return null;
+      if (trimmed.startsWith('\\')) return normalize(trimmed);
+      const [head, ...rest] = trimmed.split('\\');
+      const aliased = uses.get(head!);
+      if (aliased) return normalize(rest.length ? `${aliased}\\${rest.join('\\')}` : aliased);
+      return normalize(namespace ? `${namespace}\\${trimmed}` : trimmed);
+    };
+    return [declaration[1], declaration[2]]
+      .filter((group): group is string => Boolean(group))
+      .flatMap((group) => group.split(','))
+      .map(resolve)
+      .filter((name): name is string => Boolean(name) && name !== fqcn);
+  };
+
+  return (type: string): string[] => {
+    const cached = cache.get(type);
+    if (cached) return cached;
+    cache.set(type, []); // cycle guard while this one resolves
+    const file = fileOf(type);
+    const parents = file ? parse(fs.readFileSync(file, 'utf8').slice(0, 8192), type) : [];
+    cache.set(type, parents);
+    return parents;
+  };
+}
 
 /** Coverage lines, printed because the point of the harness is the number. */
 function report(label: string, ratio: number): void {
@@ -211,6 +288,7 @@ describe.runIf(META)('Magento DI vs compiled metadata', () => {
     const compare = (
       compiled: Record<string, Record<string, { instance?: string; disabled?: boolean }>>,
       area: string,
+      inheritance?: ReturnType<typeof pluginInheritance>,
     ): { bindings: number; agreed: number; extra: number; samples: string[] } => {
       let bindings = 0;
       let agreed = 0;
@@ -223,7 +301,9 @@ describe.runIf(META)('Magento DI vs compiled metadata', () => {
           if (!body?.instance || body.disabled) continue;
           expected.set(name, normalize(body.instance));
         }
-        const ours = new Map(pluginsFor(config, target, area).map((p) => [p.name, normalize(p.type)]));
+        const ours = new Map(
+          pluginsFor(config, target, area, inheritance).map((p) => [p.name, normalize(p.type)]),
+        );
         bindings += expected.size;
         for (const [name, instance] of expected) {
           if (ours.get(name) === instance) agreed++;
@@ -257,23 +337,22 @@ describe.runIf(META)('Magento DI vs compiled metadata', () => {
 
     /**
      * Slot 1 is the per-type chain AFTER inheritance through parents,
-     * interfaces and virtualType bases. We do not inherit yet — `pluginsFor`
-     * matches the target name exactly — so a plugin declared on an abstract
-     * block or a framework interface never reaches the concrete class. The
-     * floor records where that leaves us rather than hiding it; raise it when
-     * inheritance lands.
+     * interfaces and virtual-type bases — what actually intercepts a concrete
+     * class, including everything an abstract base or a framework interface
+     * declares on its behalf.
      */
-    it.runIf(fresh)('records how much of the inherited chain we reach', () => {
+    it.runIf(fresh)('matches the chain Magento resolved through the hierarchy', () => {
+      const inheritance = pluginInheritance(hierarchyFor(root));
       let total = 0;
       for (const { area, file } of compiledAreas()) {
-        const { bindings, agreed } = compare(loadSlot(file, 1), area);
+        const { bindings, agreed } = compare(loadSlot(file, 1), area, inheritance);
         if (bindings === 0) continue;
         total += bindings;
         report(`plugins inherited ${area} ${agreed}/${bindings}`, agreed / bindings);
         expect(
           agreed / bindings,
           `${area}: inherited plugin coverage ${agreed}/${bindings}`,
-        ).toBeGreaterThan(0.4);
+        ).toBeGreaterThan(0.95);
       }
       expect(total, 'the oracle carries inherited chains to compare').toBeGreaterThan(100);
     });

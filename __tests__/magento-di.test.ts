@@ -23,6 +23,7 @@ import {
   resolvePreference,
   resolveType,
   pluginsFor,
+  pluginInheritance,
   objectArgumentsFor,
 } from '../src/resolution/frameworks/magento/di';
 import { discoverModules, sortModules } from '../src/resolution/frameworks/magento/modules';
@@ -479,5 +480,196 @@ describe('a module that is the repository root', () => {
     });
     expect(resolvePreference(config, 'A', 'frontend')).toBe('Frontend');
     expect(resolvePreference(config, 'A')).toBe('Global');
+  });
+});
+
+/**
+ * Interception walks the class hierarchy, so a plugin declared on an abstract
+ * block or a framework interface runs on every concrete class below it — the
+ * store's own controller is intercepted by plugins it never names.
+ */
+describe('plugin inheritance', () => {
+  const hierarchy = (parents: Record<string, string[]>) =>
+    pluginInheritance((type: string) => parents[type] ?? []);
+
+  const configWith = (di: string) =>
+    build({
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+      'app/code/Acme/M/etc/di.xml': `<config>${di}</config>`,
+    });
+
+  it('collects a plugin declared on a parent class', () => {
+    const config = configWith(`
+    <type name="Acme\\Base">
+        <plugin name="from_base" type="Acme\\Plugin\\Base"/>
+    </type>`);
+
+    const parents = hierarchy({ 'Acme\\Child': ['Acme\\Base'] });
+    expect(pluginsFor(config, 'Acme\\Child', 'global', parents).map((p) => p.name)).toEqual([
+      'from_base',
+    ]);
+    // Without a hierarchy nothing is inherited — that is the default.
+    expect(pluginsFor(config, 'Acme\\Child')).toHaveLength(0);
+  });
+
+  it('collects plugins declared on an implemented interface', () => {
+    const config = configWith(`
+    <type name="Acme\\ThingInterface">
+        <plugin name="from_interface" type="Acme\\Plugin\\Thing"/>
+    </type>`);
+
+    const parents = hierarchy({ 'Acme\\Thing': ['Acme\\ThingInterface'] });
+    expect(pluginsFor(config, 'Acme\\Thing', 'global', parents).map((p) => p.name)).toEqual([
+      'from_interface',
+    ]);
+  });
+
+  it('lets a nearer ancestor disable what a farther one declared', () => {
+    const config = configWith(`
+    <type name="Acme\\ThingInterface">
+        <plugin name="shared" type="Acme\\Plugin\\Thing"/>
+    </type>
+    <type name="Acme\\Middle">
+        <plugin name="shared" disabled="true"/>
+    </type>`);
+
+    const parents = hierarchy({
+      'Acme\\Middle': ['Acme\\ThingInterface'],
+      'Acme\\Leaf': ['Acme\\Middle'],
+    });
+    expect(pluginsFor(config, 'Acme\\Middle', 'global', parents)).toHaveLength(0);
+    // A disabled plugin is removed from what descendants inherit rather than
+    // handed down as disabled, so the leaf cannot see it — or re-enable it.
+    expect(pluginsFor(config, 'Acme\\Leaf', 'global', parents)).toHaveLength(0);
+  });
+
+  it('takes the base type of a virtual type, not the virtual type name', () => {
+    const config = configWith(`
+    <virtualType name="acmeVirtual" type="Acme\\Base"/>
+    <type name="Acme\\Base">
+        <plugin name="from_base" type="Acme\\Plugin\\Base"/>
+    </type>`);
+
+    expect(
+      pluginsFor(config, 'acmeVirtual', 'global', hierarchy({})).map((p) => p.name),
+    ).toEqual(['from_base']);
+  });
+
+  // Re-pointing an inherited plugin resets its order: crossing from the
+  // ancestor's set into the type's own merges the mapped arrays, where
+  // sortOrder is always present and therefore always overwrites.
+  it('resets the order when the type re-points an inherited plugin', () => {
+    const config = configWith(`
+    <type name="Acme\\Base">
+        <plugin name="shared" type="Acme\\Plugin\\Original" sortOrder="30"/>
+    </type>
+    <type name="Acme\\Child">
+        <plugin name="shared" type="Acme\\Plugin\\Replacement"/>
+    </type>`);
+
+    const parents = hierarchy({ 'Acme\\Child': ['Acme\\Base'] });
+    expect(pluginsFor(config, 'Acme\\Base', 'global', parents)[0]!.sortOrder).toBe(30);
+    const plugins = pluginsFor(config, 'Acme\\Child', 'global', parents);
+    expect(plugins).toHaveLength(1);
+    expect(plugins[0]!.type).toBe('Acme\\Plugin\\Replacement');
+    expect(plugins[0]!.sortOrder).toBe(0);
+  });
+
+  it('merges every relation, nearest declaration last', () => {
+    const config = configWith(`
+    <type name="Acme\\Base">
+        <plugin name="a" type="Acme\\Plugin\\A" sortOrder="1"/>
+    </type>
+    <type name="Acme\\ThingInterface">
+        <plugin name="b" type="Acme\\Plugin\\B" sortOrder="2"/>
+    </type>
+    <type name="Acme\\Child">
+        <plugin name="c" type="Acme\\Plugin\\C" sortOrder="3"/>
+    </type>`);
+
+    const parents = hierarchy({ 'Acme\\Child': ['Acme\\Base', 'Acme\\ThingInterface'] });
+    expect(pluginsFor(config, 'Acme\\Child', 'global', parents).map((p) => p.name)).toEqual([
+      'a',
+      'b',
+      'c',
+    ]);
+  });
+
+  it('terminates on a hierarchy cycle', () => {
+    const config = configWith(`
+    <type name="Acme\\A">
+        <plugin name="from_a" type="Acme\\Plugin\\A"/>
+    </type>`);
+
+    const parents = hierarchy({ 'Acme\\A': ['Acme\\B'], 'Acme\\B': ['Acme\\A'] });
+    expect(pluginsFor(config, 'Acme\\A', 'global', parents).map((p) => p.name)).toEqual(['from_a']);
+  });
+});
+
+/**
+ * `ObjectManager\Config\Mapper\Dom` emits `sortOrder` for every plugin node but
+ * emits `type` and `disabled` only when the attribute is present. Within one
+ * scope the XML nodes merge attribute by attribute; across a scope boundary the
+ * mapped arrays are merged, so the always-present key overwrites and the
+ * sometimes-absent ones survive.
+ */
+describe('plugin attribute merge', () => {
+  it('keeps an earlier disabled when a later declaration omits the attribute', () => {
+    const config = build({
+      'vendor/magento/module-catalog/etc/module.xml': moduleXml('Magento_Catalog'),
+      'vendor/magento/module-catalog/etc/di.xml': `<config>
+    <type name="Acme\\Target">
+        <plugin name="shared" type="Magento\\Plugin\\Original" disabled="true"/>
+    </type>
+</config>`,
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M', ['Magento_Catalog']),
+      'app/code/Acme/M/etc/di.xml': `<config>
+    <type name="Acme\\Target">
+        <plugin name="shared" type="Acme\\Plugin\\Replacement"/>
+    </type>
+</config>`,
+    });
+
+    expect(pluginsFor(config, 'Acme\\Target')).toHaveLength(0);
+  });
+
+  it('re-enables a plugin only on an explicit disabled="false"', () => {
+    const config = build({
+      'vendor/magento/module-catalog/etc/module.xml': moduleXml('Magento_Catalog'),
+      'vendor/magento/module-catalog/etc/di.xml': `<config>
+    <type name="Acme\\Target">
+        <plugin name="shared" type="Magento\\Plugin\\Original" disabled="true"/>
+    </type>
+</config>`,
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M', ['Magento_Catalog']),
+      'app/code/Acme/M/etc/di.xml': `<config>
+    <type name="Acme\\Target">
+        <plugin name="shared" disabled="false"/>
+    </type>
+</config>`,
+    });
+
+    expect(pluginsFor(config, 'Acme\\Target').map((p) => p.type)).toEqual([
+      'Magento\\Plugin\\Original',
+    ]);
+  });
+
+  it('resets sortOrder when an area re-declares a plugin without one', () => {
+    const config = build({
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+      'app/code/Acme/M/etc/di.xml': `<config>
+    <type name="Acme\\Target">
+        <plugin name="shared" type="Acme\\Plugin\\Shared" sortOrder="50"/>
+    </type>
+</config>`,
+      'app/code/Acme/M/etc/frontend/di.xml': `<config>
+    <type name="Acme\\Target">
+        <plugin name="shared" type="Acme\\Plugin\\Frontend"/>
+    </type>
+</config>`,
+    });
+
+    expect(pluginsFor(config, 'Acme\\Target', 'global')[0]!.sortOrder).toBe(50);
+    expect(pluginsFor(config, 'Acme\\Target', 'frontend')[0]!.sortOrder).toBe(0);
   });
 });

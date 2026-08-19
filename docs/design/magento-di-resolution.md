@@ -198,8 +198,10 @@ exists to catch.
 
 Two of the comparisons deserve reading carefully. **Declared** plugins measure
 the merge. **Inherited** plugins measure the per-type chain Magento resolves
-through parent classes, interfaces and virtual-type bases — which we do not walk
-yet, so that number is a tracked gap, not a passing grade.
+through parent classes, interfaces and virtual-type bases — what actually
+intercepts a concrete class. The harness supplies the hierarchy by resolving
+each type through Composer's generated PSR-4 map and reading the declaration at
+the top of its file; the resolver gets the same hierarchy from the graph.
 
 Measured on two stores:
 
@@ -208,7 +210,7 @@ Measured on two stores:
 | Preferences | 1676/1888 · 88.8% | 1202/1414 · 85.0% |
 | Virtual types | 803/899 · 89.3% | 693/810 · 85.6% |
 | Plugins, declared | 99.0–99.4% per area | 99.8% per area |
-| Plugins, inherited | 45.8–69.5% per area | 53.9–75.5% per area |
+| Plugins, inherited | 95.8–99.5% per area | 99.8–99.9% per area |
 
 The residue is understood, not mysterious:
 
@@ -224,13 +226,32 @@ The residue is understood, not mysterious:
   winners and ~35 plugins per area that Magento never runs; the vanilla install,
   where nothing is disabled, reports zero extra plugins — which is what pins the
   diagnosis.
-- **Inheritance.** `pluginsFor` matches the target name exactly, so a plugin
-  declared on an abstract block or a framework interface never reaches the
-  concrete class.
+- **Inheritance.** What remains is one documented Magento quirk rather than a
+  rule we skipped: `inheritPlugins()` caches the *unfiltered* plugin set on a
+  type but returns the *filtered* one, so the first descendant to trigger an
+  ancestor's resolution sees a disabled plugin removed while every later
+  descendant reads the cache and keeps it. Two classes with identical ancestry
+  end up intercepted differently. We report the intended semantics — a disabled
+  plugin does not fire — rather than emulating the compiler's visiting order.
 
 An `X => X\Interceptor` entry in the compiled preference map is interception
 routing, not a declared preference — the harness folds it away, and we must
 never emit one.
+
+### Inheritance is available, not yet wired into the graph
+
+`pluginsFor` takes an optional `PluginInheritance` — build one with
+`pluginInheritance(parentsOf)` and reuse it, since it carries the memo that
+keeps ancestor walks cheap. Without it the function behaves exactly as before
+and reports only what a type declares itself.
+
+The synthesizer still calls it without a hierarchy, so the graph is unchanged.
+Wiring it up is a separate decision with a measurable cost: a plugin on
+`Magento\Framework\App\Action\Action` legitimately intercepts *every* controller,
+so the pass would stop iterating declared targets and start iterating indexed
+classes, and the edge count would grow by the size of each base class's
+subtree. That is a fan-out question to measure against `MAX_CALLBACKS_PER_CHANNEL`,
+not to assume.
 
 ## Frontier
 

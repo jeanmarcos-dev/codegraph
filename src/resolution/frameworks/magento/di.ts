@@ -70,12 +70,17 @@ export interface MagentoPlugin extends DeclarationSite {
 }
 
 /**
- * A plugin as declared, before merging. `sortOrder` stays undefined when the
- * declaration omits it, so a later re-declaration inherits the earlier order
- * instead of silently resetting it to zero.
+ * A plugin as declared, before merging. An attribute the declaration omits
+ * stays undefined, which is what makes the merge faithful:
+ * `ObjectManager\Config\Mapper\Dom` emits `sortOrder` for every plugin node —
+ * `(int)$node ?: 0` — but emits `type` and `disabled` only when the attribute is
+ * present. So within one scope an omitted attribute inherits the earlier value,
+ * and across a scope boundary `sortOrder` always overwrites while the other two
+ * survive.
  */
-interface PluginDeclaration extends Omit<MagentoPlugin, 'sortOrder'> {
+interface PluginDeclaration extends Omit<MagentoPlugin, 'sortOrder' | 'disabled'> {
   sortOrder?: number;
+  disabled?: boolean;
 }
 
 export interface MagentoObjectArgument extends DeclarationSite {
@@ -176,6 +181,7 @@ function collectPlugins(
     if (!name) continue;
     const rawSortOrder = attr(plugin, 'sortOrder');
     const sortOrder = rawSortOrder === undefined ? undefined : Number(rawSortOrder);
+    const rawDisabled = attr(plugin, 'disabled');
     out.push({
       ...site,
       line: plugin.line,
@@ -183,7 +189,7 @@ function collectPlugins(
       name,
       type: normalizeClassName(attr(plugin, 'type') ?? ''),
       sortOrder: sortOrder !== undefined && Number.isFinite(sortOrder) ? sortOrder : undefined,
-      disabled: attr(plugin, 'disabled') === 'true',
+      disabled: rawDisabled === undefined ? undefined : rawDisabled === 'true',
     });
   }
   return out;
@@ -254,7 +260,7 @@ function mergeTargetBody(
             ...existing,
             type: plugin.type || existing.type,
             sortOrder: plugin.sortOrder ?? existing.sortOrder,
-            disabled: plugin.disabled,
+            disabled: plugin.disabled ?? existing.disabled,
             filePath: plugin.filePath,
             line: plugin.line,
           }
@@ -388,15 +394,50 @@ export function isVirtualType(
 }
 
 /**
+ * Combine one plugin node across a scope boundary (global → area). Magento
+ * merges the mapped arrays, so an attribute the later scope always emits
+ * overwrites and one it emits only when declared survives.
+ */
+function acrossScopes(base: PluginDeclaration, override: PluginDeclaration): PluginDeclaration {
+  return {
+    ...override,
+    type: override.type || base.type,
+    disabled: override.disabled ?? base.disabled,
+    sortOrder: override.sortOrder ?? 0,
+  };
+}
+
+/**
  * Active plugins on `target` in `area`, ordered by `sortOrder`. Global and area
  * declarations are merged by plugin name, and disabled ones are dropped.
+ *
+ * Pass `inheritance` to also collect the plugins `target` inherits. Magento
+ * intercepts through the class hierarchy, so a plugin declared on an abstract
+ * block or a framework interface runs on every concrete class below it, and a
+ * store's own controller is intercepted by plugins it never names.
  */
 export function pluginsFor(
   config: MagentoConfig,
   target: string,
   area: string = GLOBAL_AREA,
+  inheritance?: PluginInheritance,
 ): MagentoPlugin[] {
   const name = normalizeClassName(target);
+  const merged = inheritance
+    ? inheritPlugins(config, name, area, inheritance)
+    : declaredOn(config, name, area);
+  return [...merged.values()]
+    .filter((p) => !p.disabled && p.type)
+    .map((p) => ({ ...p, sortOrder: p.sortOrder ?? 0, disabled: false }))
+    .sort((a, b) => a.sortOrder - b.sortOrder);
+}
+
+/** Plugin nodes declared on `name` itself, global scope overlaid by the area. */
+function declaredOn(
+  config: MagentoConfig,
+  name: string,
+  area: string,
+): Map<string, PluginDeclaration> {
   const merged = new Map<string, PluginDeclaration>();
   for (const plugin of config.plugins.get(GLOBAL_AREA)?.get(name)?.values() ?? []) {
     merged.set(plugin.name, plugin);
@@ -404,13 +445,85 @@ export function pluginsFor(
   if (area !== GLOBAL_AREA) {
     for (const plugin of config.plugins.get(area)?.get(name)?.values() ?? []) {
       const existing = merged.get(plugin.name);
-      merged.set(plugin.name, existing ? { ...existing, ...plugin } : plugin);
+      merged.set(plugin.name, existing ? acrossScopes(existing, plugin) : plugin);
     }
   }
-  return [...merged.values()]
-    .filter((p) => !p.disabled && p.type)
-    .map((p) => ({ ...p, sortOrder: p.sortOrder ?? 0 }))
-    .sort((a, b) => a.sortOrder - b.sortOrder);
+  return merged;
+}
+
+/**
+ * The class hierarchy interception walks, plus the memo that keeps it cheap.
+ * Build one per project with `pluginInheritance` and reuse it: without the
+ * memo every query re-walks the same ancestors.
+ */
+export interface PluginInheritance {
+  /** Direct parents of a type — its base class first, then its interfaces. */
+  parentsOf(type: string): string[];
+}
+
+/** Resolved plugin sets, keyed by inheritance instance then area then type. */
+const inheritanceMemos = new WeakMap<
+  PluginInheritance,
+  Map<string, Map<string, Map<string, PluginDeclaration>>>
+>();
+
+/** A reusable hierarchy walker backed by `parentsOf`. */
+export function pluginInheritance(parentsOf: (type: string) => string[]): PluginInheritance {
+  const inheritance: PluginInheritance = { parentsOf };
+  inheritanceMemos.set(inheritance, new Map());
+  return inheritance;
+}
+
+/**
+ * Mirror of `PluginListGenerator::inheritPlugins`.
+ *
+ * Each relation is resolved in full and the results overlaid, rather than
+ * flattening the ancestors into one list: a nearer ancestor has to win over a
+ * farther one, which is how a `<plugin name="x" disabled="true"/>` on an
+ * intermediate class switches off a plugin an interface declared further up.
+ * Own declarations go on last.
+ *
+ * The memo holds the set INCLUDING disabled entries, while what a descendant
+ * inherits excludes them — Magento caches the unfiltered set on the type and
+ * hands callers the filtered one, so a descendant can neither see a disabled
+ * plugin nor re-enable it.
+ */
+function inheritPlugins(
+  config: MagentoConfig,
+  type: string,
+  area: string,
+  inheritance: PluginInheritance,
+): Map<string, PluginDeclaration> {
+  const memo = inheritanceMemos.get(inheritance) ?? new Map();
+  const byType = memo.get(area) ?? new Map<string, Map<string, PluginDeclaration>>();
+  if (!memo.has(area)) memo.set(area, byType);
+
+  const cached = byType.get(type);
+  if (cached) return cached;
+
+  const combined = new Map<string, PluginDeclaration>();
+  byType.set(type, combined); // also the cycle guard: a loop contributes nothing
+
+  // getOriginalInstanceType — a virtual type takes its base's plugins and none
+  // of its own relations.
+  const base = virtualTypeEntry(config, type, area)?.type;
+  const relations = base ? [base] : inheritance.parentsOf(type);
+  for (const relation of relations) {
+    if (!relation) continue;
+    const parent = inheritPlugins(config, normalizeClassName(relation), area, inheritance);
+    for (const [pluginName, row] of parent) {
+      if (row.disabled) continue;
+      const previous = combined.get(pluginName);
+      combined.set(pluginName, previous ? acrossScopes(previous, row) : row);
+    }
+  }
+
+  for (const [pluginName, row] of declaredOn(config, type, area)) {
+    const previous = combined.get(pluginName);
+    combined.set(pluginName, previous ? acrossScopes(previous, row) : row);
+  }
+
+  return combined;
 }
 
 /** Object-typed constructor arguments configured for `target` in `area`. */
