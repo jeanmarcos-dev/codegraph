@@ -1,0 +1,135 @@
+# Magento 2 / Adobe Commerce support
+
+**Status:** implemented (resolver + 7 synthesis passes).
+**Audience:** anyone extending or debugging the Magento integration.
+
+## The problem
+
+Magento is the extreme case of the dynamic-dispatch problem this repo's
+[playbook](./dynamic-dispatch-coverage-playbook.md) is about: almost nothing that
+decides *what code runs* is written in PHP. It is written in XML, in a dozen
+dialects, and merged at runtime by the object manager.
+
+Before this work, indexing a Magento project produced a graph that was wrong in a
+specific and misleading way — not incomplete, but confidently pointing at code
+that never executes:
+
+| Question an agent asks | What the graph said |
+|---|---|
+| What runs when I call `ProductRepositoryInterface::getById`? | The interface's empty method body. The `<preference>` naming the real class is invisible. |
+| What intercepts `Product::getPrice`? | Nothing. Plugins are compiled into a generated `Interceptor` subclass; no source references them. |
+| What does `$this->itemFactory->create()` build? | Nothing. `ItemFactory` is generated at build time and exists on no disk. |
+| Which observers run on `sales_order_place_after`? | Nothing. The event is a string on both sides. |
+| What serves `GET /V1/products/:sku`? | Nothing. `webapi.xml` names an interface. |
+| Which block feeds `view.phtml`? | Nothing. `.phtml` was not even a recognised extension. |
+
+## The core: reproducing Magento's config merge
+
+Everything else depends on getting this right, because the answer to "which class
+runs" is a function of module load order, not of the XML alone.
+
+`frameworks/magento/modules.ts` discovers modules (`etc/module.xml` next to
+`registration.php`) and orders them the way `ModuleList\Loader::sortBySequence`
+does: a depth-first walk over `<sequence>` from an alphabetical seed. Sequence
+entries naming modules that are not indexed are skipped, and cycles degrade to
+"some order" instead of hanging.
+
+`frameworks/magento/di.ts` then merges every `di.xml` in that order — all global
+files first, then each area's — reproducing four rules:
+
+1. **`<preference>`** — later module wins, and preferences chain (`A→B`, `B→C`
+   resolves `A` to `C`).
+2. **Area layering** — `etc/frontend/di.xml` is global config *plus* the area's
+   overrides. A frontend preference must never be reported for adminhtml.
+3. **`<plugin>`** — accumulated across modules and keyed by plugin *name* within
+   a target, which is how a later module flips `disabled="true"` on an inherited
+   plugin or re-points it; ordered by `sortOrder`. A re-declaration that omits
+   `sortOrder` inherits the earlier one; an explicit `sortOrder="0"` does not.
+4. **`<virtualType>`** — a configured alias usable anywhere a class name is,
+   including as a plugin target and as an injected argument.
+
+The merged table is cached per project root in `frameworks/magento/config.ts`,
+keyed by a signature of the XML file set so it rebuilds when that set changes.
+
+## What gets into the graph
+
+**The resolver** (`frameworks/magento/index.ts`, registered in
+`frameworks/index.ts`) detects the project, turns Magento XML into nodes and
+references during extraction, and resolves a type name to the node the DI config
+says will really be used.
+
+Detection covers a full store (composer metapackage), a distributable module
+(`type: magento2-module`), and a module with no `composer.json` at all
+(`registration.php` beside `etc/module.xml`) — requiring both files so an
+unrelated `etc/module.xml` cannot trigger it.
+
+References that name no declared symbol — FQCNs, virtual-type names, and the
+synthetic `magento:module:` / `magento:type:` / `magento:template:` forms — are
+claimed through `claimsReference`, without which `resolveOne`'s name pre-filter
+drops them before `resolve()` runs. This is the same trap documented for Drupal
+and Rails.
+
+**Seven synthesis passes** (`resolution/magento-synthesizer.ts`, registered in
+`SYNTH_PASSES`, gated on `php` *and* `xml`):
+
+| Pass | Edge | `synthesizedBy` |
+|---|---|---|
+| preference | interface method → the method that really runs | `magento-preference` |
+| plugin | intercepted method → each `before`/`around`/`after` wrapping it | `magento-plugin` |
+| di-argument | constructor → the class configuration injects (array items included) | `magento-di-argument` |
+| factory | calling method → the class `->create()` builds | `magento-factory` |
+| event dispatch | `dispatch('name')` site → the event node | `magento-event` |
+| controller route | front name → the action classes serving it | `magento-controller` |
+| template | `.phtml` → the block / view-model methods it calls | `magento-template` |
+
+Every edge is `provenance: 'heuristic'` and carries `registeredAt` — the
+`di.xml`, `events.xml` or layout line an agent would otherwise grep for.
+
+Synthetic nodes reuse existing kinds: `module` per Magento module (with edges to
+its `<sequence>` dependencies), `route` for web-API endpoints, front names, cron
+jobs and queue consumers, `component` for layout blocks and UI components, and
+`function` for events. No change to `NODE_KINDS`, so the native kernel's wire
+contract is untouched.
+
+## The deliberate limits
+
+**Both ends must be indexed.** Every pass drops an edge whose target class is not
+in the graph. With `vendor/` excluded by default, most plugins on core classes
+therefore produce no edge at all. This is the "silent beats wrong" rule from the
+playbook: a synthesized edge to a class we never read would be a fabricated
+claim. The plugin class itself stays indexed and searchable either way.
+
+**`vendor/` is not indexed by default** and `codegraph.json`'s `include` cannot
+override that — `ScopeIgnore.ignores` never resurfaces a built-in default-ignored
+directory. Projects that want core coverage need a `.gitignore` negation
+(`!vendor/`), which pulls in every Composer package, not just Magento's. A repo
+like `magento/magento2` that keeps its modules under `app/code` has the whole
+core indexed with no special handling.
+
+**Recommended `codegraph.json`** for a store, to keep generated and static output
+out of the graph:
+
+```json
+{
+  "exclude": ["app/etc/**", "generated/**", "pub/static/**", "pub/media/**", "var/**"]
+}
+```
+
+`app/etc` is excluded because `env.php` holds credentials and `config.php` is a
+module list, not code.
+
+## Frontier
+
+- **Interceptor chains between plugins.** Plugin ordering is modelled
+  (`sortOrder`) but an `around` plugin calling `$proceed()` into the next plugin
+  is not an edge; each plugin links to the intercepted method directly.
+- **`extension_attributes.xml`** — generated getters/setters on the extension
+  attribute interfaces.
+- **GraphQL resolvers** — `schema.graphqls` `@resolver(class:)` directives are
+  not read (the file is not XML, and `.graphqls` is not an indexed extension).
+- **`$this->_view`, `getLayout()->createBlock()`** — blocks created
+  programmatically rather than through layout XML.
+- **UI component `component` fields** — the JS side of a UI component
+  (`Magento_Ui/js/grid/listing`) is a RequireJS path, not linked to its file.
+- **`db_schema.xml`, `system.xml`, `acl.xml`** — configuration with no code
+  target, deliberately skipped.
