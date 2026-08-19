@@ -167,6 +167,71 @@ rotate a symlink (`current_source`, `htdocs`, …) at the active one; that
 project directory is not a Magento root, and its `.gitignore` usually hides the
 checkouts. Index each checkout, not the directory above them.
 
+## Validation: Magento's own compiled metadata
+
+`setup:di:compile` writes the fully merged, area-resolved configuration to
+`generated/metadata/`. That is what the runtime reads, so it is ground truth for
+everything on this page:
+
+| File | Carries |
+|---|---|
+| `<area>.php` | `preferences`, `instanceTypes` (virtual types), `arguments` |
+| `primary\|global\|<area>\|plugin-list.php` | plugins, in three slots: direct declarations, per-type chains after inheritance, processed |
+
+`__tests__/magento-oracle.test.ts` compares our merge against it. Point
+`CODEGRAPH_MAGENTO_ORACLE` at a compiled Magento root:
+
+```bash
+CODEGRAPH_MAGENTO_ORACLE=/path/to/store npx vitest run __tests__/magento-oracle.test.ts
+```
+
+It skips cleanly when the variable is unset, when the project was never
+compiled, or when `php` is absent, and it reads every `di.xml` on disk —
+`vendor/` included — because what is under test is the merge, not which modules
+a project chooses to index.
+
+**It refuses to run against a stale oracle.** If `generated/metadata` predates
+the newest `di.xml`, the comparisons are skipped and a dedicated test fails
+saying so. A disagreement with stale ground truth says nothing about our code,
+and "fixing" ourselves to match it would introduce the exact bug the harness
+exists to catch.
+
+Two of the comparisons deserve reading carefully. **Declared** plugins measure
+the merge. **Inherited** plugins measure the per-type chain Magento resolves
+through parent classes, interfaces and virtual-type bases — which we do not walk
+yet, so that number is a tracked gap, not a passing grade.
+
+Measured on two stores:
+
+| | Adobe Commerce 2.4.7, 805 modules | Magento 2.4.7 vanilla |
+|---|---|---|
+| Preferences | 1676/1888 · 88.8% | 1202/1414 · 85.0% |
+| Virtual types | 803/899 · 89.3% | 693/810 · 85.6% |
+| Plugins, declared | 99.0–99.4% per area | 99.8% per area |
+| Plugins, inherited | 45.8–69.5% per area | 53.9–75.5% per area |
+
+The residue is understood, not mysterious:
+
+- **The `primary` scope.** `app/etc/di.xml` loads before every module's, and a
+  stock one carries ~228 preferences (`DateTimeInterface`, the Redis session
+  handlers, the ACL cache). `moduleOf()` returns nothing for a file outside a
+  module, so we drop all of them. That is most of the preference gap.
+- **Disabled modules.** Load order comes from `app/etc/config.php`:
+  `ModuleList::getNames()` is `array_keys(array_filter($configData))`, and that
+  filter drops disabled modules. We reproduce `sortBySequence()` instead, which
+  `Module\Dir\Reader::getFiles()` never calls, and we cannot tell which modules
+  are off. On the store with 30 disabled modules that costs 5 wrong preference
+  winners and ~35 plugins per area that Magento never runs; the vanilla install,
+  where nothing is disabled, reports zero extra plugins — which is what pins the
+  diagnosis.
+- **Inheritance.** `pluginsFor` matches the target name exactly, so a plugin
+  declared on an abstract block or a framework interface never reaches the
+  concrete class.
+
+An `X => X\Interceptor` entry in the compiled preference map is interception
+routing, not a declared preference — the harness folds it away, and we must
+never emit one.
+
 ## Frontier
 
 - **Interceptor chains between plugins.** Plugin ordering is modelled
