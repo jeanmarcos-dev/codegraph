@@ -9,6 +9,7 @@ import type { Language } from '../../types';
 import { drupalResolver } from './drupal';
 import { laravelResolver } from './laravel';
 import { magentoResolver } from './magento';
+import { mageObsidianResolver } from './mage-obsidian';
 import { expressResolver } from './express';
 import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
@@ -39,6 +40,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   laravelResolver,
   drupalResolver,
   magentoResolver,
+  mageObsidianResolver,
   // JavaScript/TypeScript
   expressResolver,
   nestjsResolver,
@@ -136,6 +138,7 @@ export function registerFrameworkResolver(resolver: FrameworkResolver): void {
 export { drupalResolver } from './drupal';
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { magentoResolver } from './magento';
+export { mageObsidianResolver } from './mage-obsidian';
 export { expressResolver } from './express';
 export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
