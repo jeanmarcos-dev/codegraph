@@ -127,20 +127,45 @@ out of the graph:
   "exclude": [
     "app/etc/**",
     "generated/**",
+    "var/**",
     "pub/static/**",
     "pub/media/**",
-    "var/**",
+    "pub/errors/**",
+    "dev/tests/**",
+    "dev/tools/**",
+    "setup/**",
+    "lib/web/**",
     "**/Test/Mftf/**"
   ]
 }
 ```
 
-`app/etc` is excluded because `env.php` holds credentials and `config.php` is a
-module list, not code. MFTF is worth calling out separately: those XML files are
-functional-test fixtures, never store behaviour, and on the `magento/magento2`
-development repository they are **6,360 of the 9,749 XML files** — two thirds of
-the XML in the graph, contributing nothing to any question about how the store
-works.
+This matters more than it looks. A store installed from the Magento
+distribution (rather than cloned) carries no `.gitignore`, so only the built-in
+default ignores apply and everything above lands in the graph. Measured on a
+2.4.7 install with one custom module: **15,837 files scanned, 187 of them the
+store’s own code** — 1.2%. The same tree with these exclusions scans **199**.
+
+Two entries are about correctness rather than noise:
+
+- `app/etc` — `env.php` holds credentials and `config.php` is a module list,
+  not code.
+- `generated` — these are the `Interceptor`, `Factory` and `Proxy` classes
+  Magento writes at runtime, which is exactly what the passes above synthesize
+  from `di.xml`. Indexing them puts a second, competing definition of every
+  intercepted class in the graph.
+
+MFTF is worth calling out separately: those XML files are functional-test
+fixtures, never store behaviour, and on the `magento/magento2` development
+repository they are **6,360 of the 9,749 XML files** — two thirds of the XML in
+the graph, contributing nothing to any question about how the store works.
+
+**Where to run `init`.** The indexed root must be the Magento root — the
+directory holding `composer.json`, `app/` and `bin/magento`. Docker-based dev
+setups often keep several checkouts side by side under a project directory and
+rotate a symlink (`current_source`, `htdocs`, …) at the active one; that
+project directory is not a Magento root, and its `.gitignore` usually hides the
+checkouts. Index each checkout, not the directory above them.
 
 ## Frontier
 
