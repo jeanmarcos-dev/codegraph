@@ -85,6 +85,19 @@ and Rails.
 Every edge is `provenance: 'heuristic'` and carries `registeredAt` — the
 `di.xml`, `events.xml` or layout line an agent would otherwise grep for.
 
+**Method matching follows inheritance.** Magento leans on inheritance heavily —
+every `SearchResults` implementation gets `getItems` from a framework base
+class, most models extend `AbstractModel` — so matching only self-declared
+methods misses a large share of preference targets. Supertypes are walked to a
+bounded depth, and a method the type declares itself always wins over an
+inherited one of the same name, since that is the method that actually runs.
+
+Measured on a Magento core subset (Store, Catalog, CatalogInventory, Customer,
+Directory, Eav + `Magento\Framework`; 5,540 files): **192 of 224 preferences
+(85%)** link to the class their `type` names, up from 72% when only
+self-declared methods were matched. Of the 32 that do not, 27 are the `__call`
+frontier described below and 5 name a class outside the indexed subset.
+
 Synthetic nodes reuse existing kinds: `module` per Magento module (with edges to
 its `<sequence>` dependencies), `route` for web-API endpoints, front names, cron
 jobs and queue consumers, `component` for layout blocks and UI components, and
@@ -111,12 +124,23 @@ out of the graph:
 
 ```json
 {
-  "exclude": ["app/etc/**", "generated/**", "pub/static/**", "pub/media/**", "var/**"]
+  "exclude": [
+    "app/etc/**",
+    "generated/**",
+    "pub/static/**",
+    "pub/media/**",
+    "var/**",
+    "**/Test/Mftf/**"
+  ]
 }
 ```
 
 `app/etc` is excluded because `env.php` holds credentials and `config.php` is a
-module list, not code.
+module list, not code. MFTF is worth calling out separately: those XML files are
+functional-test fixtures, never store behaviour, and on the `magento/magento2`
+development repository they are **6,360 of the 9,749 XML files** — two thirds of
+the XML in the graph, contributing nothing to any question about how the store
+works.
 
 ## Frontier
 
@@ -131,5 +155,11 @@ module list, not code.
   programmatically rather than through layout XML.
 - **UI component `component` fields** — the JS side of a UI component
   (`Magento_Ui/js/grid/listing`) is a RequireJS path, not linked to its file.
+- **Magic `__call` getters and setters.** `AttributeInterface::getAttributeCode`
+  has no implementation anywhere: `DataObject::__call` turns it into
+  `getData('attribute_code')` at runtime. There is no method node to link to, so
+  these preferences resolve at the type level only. This is the same
+  metaprogramming frontier as ActiveRecord dynamic finders and Spring Data JPA
+  derived queries.
 - **`db_schema.xml`, `system.xml`, `acl.xml`** — configuration with no code
   target, deliberately skipped.
