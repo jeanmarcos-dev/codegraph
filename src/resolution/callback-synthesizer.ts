@@ -37,6 +37,11 @@ import {
   magentoControllerRouteEdges,
   magentoTemplateEdges,
 } from './magento-synthesizer';
+import {
+  mageObsidianImportEdges,
+  mageObsidianTwigEdges,
+  mageObsidianContractEdges,
+} from './mage-obsidian-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -3624,6 +3629,21 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     name: 'magentoTemplateEdges',
     gate: (has) => has('php') && has('xml'),
     run: (q, c, y) => magentoTemplateEdges(q, c, y),
+  },
+  {
+    name: 'obsidianImportEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (_q, c, y) => mageObsidianImportEdges(c, y),
+  },
+  {
+    name: 'obsidianTwigEdges',
+    gate: (has) => has('twig'),
+    run: (q, c, y) => mageObsidianTwigEdges(q, c, y),
+  },
+  {
+    name: 'obsidianContractEdges',
+    gate: (has) => has('php') && (has('typescript') || has('javascript')),
+    run: (_q, c, y) => mageObsidianContractEdges(c, y),
   },
   {
     name: 'cFnPtrEdges',
