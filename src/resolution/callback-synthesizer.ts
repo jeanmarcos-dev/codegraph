@@ -28,6 +28,15 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import {
+  magentoPreferenceEdges,
+  magentoPluginEdges,
+  magentoDiArgumentEdges,
+  magentoFactoryEdges,
+  magentoEventDispatchEdges,
+  magentoControllerRouteEdges,
+  magentoTemplateEdges,
+} from './magento-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -3581,6 +3590,41 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     run: (q, c, y) => erlangBehaviourDispatchEdges(q, c, y),
   },
   { name: 'laravelEdges', gate: (has) => has('php'), run: (_q, c, y) => laravelEventEdges(c, y) },
+  {
+    name: 'magentoPreferenceEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (q, c, y) => magentoPreferenceEdges(q, c, y),
+  },
+  {
+    name: 'magentoPluginEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (q, c, y) => magentoPluginEdges(q, c, y),
+  },
+  {
+    name: 'magentoDiArgumentEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (q, c, y) => magentoDiArgumentEdges(q, c, y),
+  },
+  {
+    name: 'magentoFactoryEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (q, c, y) => magentoFactoryEdges(q, c, y),
+  },
+  {
+    name: 'magentoEventDispatchEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (_q, c, y) => magentoEventDispatchEdges(c, y),
+  },
+  {
+    name: 'magentoControllerRouteEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (_q, c, y) => magentoControllerRouteEdges(c, y),
+  },
+  {
+    name: 'magentoTemplateEdges',
+    gate: (has) => has('php') && has('xml'),
+    run: (q, c, y) => magentoTemplateEdges(q, c, y),
+  },
   {
     name: 'cFnPtrEdges',
     gate: (has) => has('c', 'cpp'),
