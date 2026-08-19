@@ -2471,6 +2471,61 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'magento-preference') {
+      return {
+        label: `Magento di.xml <preference> — this is the class the object manager instantiates (dynamic dispatch)`,
+        compact: `dynamic: di.xml preference${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'magento-plugin') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'a plugin';
+      return {
+        label: `Magento plugin ${via} — an interceptor wrapping this method (dynamic dispatch)`,
+        compact: `dynamic: plugin ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'magento-di-argument') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'an argument';
+      return {
+        label: `Magento di.xml argument ${via} — the class configuration injects here (dynamic dispatch)`,
+        compact: `dynamic: di.xml argument ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'magento-factory') {
+      const via = m.via ? `\`$${String(m.via)}\`` : 'a factory';
+      return {
+        label: `Magento generated factory ${via} — ->create() builds this class (dynamic dispatch)`,
+        compact: `dynamic: factory ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'magento-event') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'an event';
+      return {
+        label: `Magento event dispatch ${via} — observers registered in events.xml run here (dynamic dispatch)`,
+        compact: `dynamic: dispatch ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'magento-controller') {
+      const via = m.via ? `\`/${String(m.via)}\`` : 'a front name';
+      return {
+        label: `Magento route ${via} — resolved to this action class by convention (dynamic dispatch)`,
+        compact: `dynamic: route ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'magento-template') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'a block method';
+      return {
+        label: `Magento template call ${via} — bound to this class by layout XML (dynamic dispatch)`,
+        compact: `dynamic: template ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
     // Generic fallback for any other synthesizer (redux-thunk, gin-middleware-chain,
     // flutter-build, …): a synthesized hop must never read as a bare static `calls`.
     // It's a dynamic-dispatch bridge — label it as one and keep its wiring site.
