@@ -22,7 +22,14 @@ import type { Edge, Node } from '../src/types';
 
 interface Fixture {
   files: Record<string, string>;
-  classes: Array<{ fqcn: string; kind?: Node['kind']; methods: string[]; filePath?: string }>;
+  classes: Array<{
+    fqcn: string;
+    kind?: Node['kind'];
+    methods: string[];
+    filePath?: string;
+    /** FQCN this type extends, so inherited-method lookups have an edge to walk. */
+    extends?: string;
+  }>;
 }
 
 /**
@@ -88,6 +95,15 @@ function buildGraph(fixture: Fixture) {
       };
       nodes.push(methodNode);
       containsEdges.push({ source: classNode.id, target: methodNode.id, kind: 'contains', line: 5 });
+    }
+
+    if (declaration.extends) {
+      containsEdges.push({
+        source: classNode.id,
+        target: `class:${declaration.extends}`,
+        kind: 'extends',
+        line: 1,
+      });
     }
   }
 
@@ -737,5 +753,78 @@ describe('magentoControllerRouteEdges', () => {
     const edges = await magentoControllerRouteEdges(context, noYield);
     expect(edges).toHaveLength(1);
     expect(edges[0]!.metadata!.via).toBe('acmepay/alias/create');
+  });
+});
+
+describe('inherited methods', () => {
+  function withInheritance() {
+    const built = buildGraph({
+      files: moduleFiles(
+        'Acme_M',
+        `<config>
+    <preference for="Acme\\Api\\SearchResultsInterface" type="Acme\\Model\\SearchResults"/>
+</config>`,
+      ),
+      classes: [
+        {
+          fqcn: 'Acme\\Api\\SearchResultsInterface',
+          kind: 'interface',
+          methods: [],
+          extends: 'Acme\\Api\\BaseSearchResultsInterface',
+        },
+        { fqcn: 'Acme\\Api\\BaseSearchResultsInterface', kind: 'interface', methods: ['getItems'] },
+        {
+          fqcn: 'Acme\\Model\\SearchResults',
+          methods: [],
+          extends: 'Acme\\Framework\\AbstractSearchResults',
+        },
+        { fqcn: 'Acme\\Framework\\AbstractSearchResults', methods: ['getItems'] },
+      ],
+    });
+    return built;
+  }
+
+  it('links through inheritance on both sides of a preference', async () => {
+    const { queries, context } = withInheritance();
+    const edges = await magentoPreferenceEdges(queries, context, noYield);
+    expect(edges).toHaveLength(1);
+    expect(edges[0]!.source).toBe('method:Acme\\Api\\BaseSearchResultsInterface::getItems');
+    expect(edges[0]!.target).toBe('method:Acme\\Framework\\AbstractSearchResults::getItems');
+  });
+
+  it('prefers a method the class declares itself over the inherited one', async () => {
+    const built = buildGraph({
+      files: moduleFiles(
+        'Acme_M',
+        '<config><preference for="Acme\\Api\\FooInterface" type="Acme\\Model\\Foo"/></config>',
+      ),
+      classes: [
+        { fqcn: 'Acme\\Api\\FooInterface', kind: 'interface', methods: ['run'] },
+        { fqcn: 'Acme\\Model\\Foo', methods: ['run'], extends: 'Acme\\Model\\BaseFoo' },
+        { fqcn: 'Acme\\Model\\BaseFoo', methods: ['run'] },
+      ],
+    });
+    const edges = await magentoPreferenceEdges(built.queries, built.context, noYield);
+    expect(edges.map((e) => e.target)).toEqual(['method:Acme\\Model\\Foo::run']);
+  });
+
+  it('links a plugin to a method the intercepted class inherits', async () => {
+    const built = buildGraph({
+      files: moduleFiles(
+        'Acme_M',
+        `<config>
+    <type name="Acme\\Model\\Child">
+        <plugin name="acme" type="Acme\\Plugin\\P"/>
+    </type>
+</config>`,
+      ),
+      classes: [
+        { fqcn: 'Acme\\Model\\Child', methods: [], extends: 'Acme\\Model\\Base' },
+        { fqcn: 'Acme\\Model\\Base', methods: ['save'] },
+        { fqcn: 'Acme\\Plugin\\P', methods: ['beforeSave'] },
+      ],
+    });
+    const edges = await magentoPluginEdges(built.queries, built.context, noYield);
+    expect(edges.map((e) => e.source)).toEqual(['method:Acme\\Model\\Base::save']);
   });
 });

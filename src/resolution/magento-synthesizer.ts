@@ -84,12 +84,48 @@ function typeNode(queries: MagentoQueries, fqcn: string): Node | null {
   return generated ? lookupType(queries, generated.base) : null;
 }
 
-function methodsOf(queries: MagentoQueries, typeId: string): Map<string, Node> {
+function ownMethodsOf(queries: MagentoQueries, typeId: string): Map<string, Node> {
   const methods = new Map<string, Node>();
   for (const edge of queries.getOutgoingEdges(typeId, ['contains'])) {
     const node = queries.getNodeById(edge.target);
     if (node && node.kind === 'method' && !methods.has(node.name)) methods.set(node.name, node);
   }
+  return methods;
+}
+
+const MAX_INHERITANCE_DEPTH = 6;
+
+/**
+ * A type's methods including the ones it inherits.
+ *
+ * Magento leans on inheritance heavily — every `SearchResults` implementation
+ * gets `getItems` from a framework base class, most models extend
+ * `AbstractModel` — so matching only self-declared methods misses the majority
+ * of preference targets. A method the type declares itself always wins over an
+ * inherited one of the same name, which is the method that actually runs.
+ */
+function methodsOf(queries: MagentoQueries, typeId: string): Map<string, Node> {
+  const methods = ownMethodsOf(queries, typeId);
+  const seen = new Set<string>([typeId]);
+  let frontier = [typeId];
+
+  for (let depth = 0; depth < MAX_INHERITANCE_DEPTH && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      for (const edge of queries.getOutgoingEdges(id, ['extends', 'implements'])) {
+        if (seen.has(edge.target)) continue;
+        seen.add(edge.target);
+        const supertype = queries.getNodeById(edge.target);
+        if (!supertype || (supertype.kind !== 'class' && supertype.kind !== 'interface')) continue;
+        next.push(supertype.id);
+        for (const [name, method] of ownMethodsOf(queries, supertype.id)) {
+          if (!methods.has(name)) methods.set(name, method);
+        }
+      }
+    }
+    frontier = next;
+  }
+
   return methods;
 }
 
