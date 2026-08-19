@@ -90,6 +90,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cshtml': 'razor',
   '.razor': 'razor',
   '.php': 'php',
+  // Magento 2 / Adobe Commerce templates — PHP interleaved with HTML. The
+  // bundled `tree-sitter-php` grammar (not the `php_only` dialect) parses the
+  // mixed form directly, so `$block->getX()` / `$viewModel->y()` callsites in a
+  // theme template become real refs instead of an invisible view layer.
+  '.phtml': 'php',
   // Drupal-specific PHP file extensions
   '.module': 'php',
   '.install': 'php',
