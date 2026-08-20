@@ -18,7 +18,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { loadExcludePatterns, loadExtensionOverrides, loadIncludeIgnoredPatterns, clearProjectConfigCache } from '../src/project-config';
+import { loadExcludePatterns, loadExtensionOverrides, loadIncludeIgnoredPatterns, loadMagentoInheritPlugins, clearProjectConfigCache } from '../src/project-config';
 import { scanDirectory } from '../src/extraction';
 
 describe('exclude loader (codegraph.json)', () => {
@@ -161,5 +161,56 @@ describe('exclude behavior — scanDirectory drops excluded paths (#999)', () =>
     const files = scanDirectory(dir).map((f) => f.replace(/\\/g, '/'));
     expect(files).toContain('app/main.ts');
     expect(files.some((f) => f.startsWith('static/'))).toBe(true);
+  });
+});
+
+/**
+ * `codegraph.json` `magento.inheritPlugins` — the one switch that changes what
+ * the Magento resolver claims runs, so its default and its failure modes matter
+ * more than most.
+ */
+describe('magento.inheritPlugins loader (codegraph.json)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-magento-cfg-'));
+    clearProjectConfigCache();
+  });
+  afterEach(() => {
+    clearProjectConfigCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const writeConfig = (obj: unknown) =>
+    fs.writeFileSync(
+      path.join(dir, 'codegraph.json'),
+      typeof obj === 'string' ? obj : JSON.stringify(obj),
+    );
+
+  it('is on when there is no codegraph.json', () => {
+    expect(loadMagentoInheritPlugins(dir)).toBe(true);
+  });
+
+  it('is on when the file exists but says nothing about magento', () => {
+    writeConfig({ exclude: ['var/**'] });
+    expect(loadMagentoInheritPlugins(dir)).toBe(true);
+  });
+
+  it('turns off on an explicit false', () => {
+    writeConfig({ magento: { inheritPlugins: false } });
+    expect(loadMagentoInheritPlugins(dir)).toBe(false);
+  });
+
+  it('falls back to the default on a non-boolean, rather than throwing', () => {
+    writeConfig({ magento: { inheritPlugins: 'no' } });
+    expect(loadMagentoInheritPlugins(dir)).toBe(true);
+  });
+
+  it('falls back to the default when magento is not an object', () => {
+    writeConfig({ magento: ['inheritPlugins'] });
+    expect(loadMagentoInheritPlugins(dir)).toBe(true);
+  });
+
+  it('falls back to the default on unparseable JSON', () => {
+    writeConfig('{ "magento": { ');
+    expect(loadMagentoInheritPlugins(dir)).toBe(true);
   });
 });

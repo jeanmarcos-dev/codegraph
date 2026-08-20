@@ -238,20 +238,52 @@ An `X => X\Interceptor` entry in the compiled preference map is interception
 routing, not a declared preference — the harness folds it away, and we must
 never emit one.
 
-### Inheritance is available, not yet wired into the graph
+### Inheritance in the graph, and its measured fan-out
 
-`pluginsFor` takes an optional `PluginInheritance` — build one with
-`pluginInheritance(parentsOf)` and reuse it, since it carries the memo that
-keeps ancestor walks cheap. Without it the function behaves exactly as before
-and reports only what a type declares itself.
+`magento-plugin` edges follow the hierarchy by default. Turn it off per project:
 
-The synthesizer still calls it without a hierarchy, so the graph is unchanged.
-Wiring it up is a separate decision with a measurable cost: a plugin on
-`Magento\Framework\App\Action\Action` legitimately intercepts *every* controller,
-so the pass would stop iterating declared targets and start iterating indexed
-classes, and the edge count would grow by the size of each base class's
-subtree. That is a fan-out question to measure against `MAX_CALLBACKS_PER_CHANNEL`,
-not to assume.
+```json
+{ "magento": { "inheritPlugins": false } }
+```
+
+The pass does not ask every indexed class. A type can only gain plugins if a
+declared target sits somewhere above it, so `pluginCandidates` walks the
+hierarchy once and the per-area loop stays on that set — on a store where almost
+nothing is intercepted, that is close to the declared targets themselves.
+
+Measured on the Adobe Commerce store, `vendor/` indexed (71,989 files, 809,532
+nodes):
+
+| | Inheritance off | Inheritance on |
+|---|---|---|
+| `magento-plugin` edges | 2,096 | 17,977 |
+| Edges in the whole graph | 2,167,063 | 2,182,944 (+0.73%) |
+| Nodes | 809,532 | unchanged |
+| Index wall clock | 955s | 989s |
+
+Read that last row as "no measured cost" rather than "3.5% slower": it is one
+run per arm, and the indexer's own timer disagrees with the shell's on the sign
+(13m32s off versus 13m16s on). The candidate filter is what keeps it there —
+without it the same store indexed in 1001s and produced the identical 17,977
+edges, so the filter costs nothing in coverage.
+
+The channel grows 8.6× while the graph grows 0.73%, and no target comes near
+`MAX_EDGES_PER_TARGET`: the busiest intercepted method is
+`Framework\Model\ResourceModel\Db\AbstractDb::save` with 28 plugins, across
+3,500 intercepted methods in total.
+
+The reason the fan-out stays bounded is worth knowing. When a subclass does not
+override the intercepted method, `methodsOf` resolves it to the ancestor's
+method — the same node the declared edge already points at — so no edge is
+added. New edges appear only where a subclass genuinely overrides, which is a
+small fraction of any hierarchy.
+
+**On a store that leaves `vendor/` out, this changes nothing at all.** Measured
+on the same store's `app/code` alone: 42 plugin edges either way, identical node
+and edge totals. The store declares 197 plugin targets, 25 of them indexed, and
+*no* indexed class inherits from an intercepted one — a store's plugins target
+core classes, and its own classes do not descend from the classes it intercepts.
+So the switch matters only once the core is in the index.
 
 ## Frontier
 

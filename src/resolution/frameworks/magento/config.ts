@@ -15,6 +15,7 @@
  */
 
 import type { ResolutionContext } from '../../types';
+import { loadMagentoInheritPlugins } from '../../../project-config';
 import { discoverModules, sortModules, type MagentoModule } from './modules';
 import { buildDiConfig, type MagentoConfig } from './di';
 import { buildTemplateIndex, type TemplateIndex } from './layout';
@@ -26,6 +27,8 @@ export interface MagentoProject {
   modulePaths: Map<string, string>;
   /** `Vendor_Module::path.phtml` → indexed file, theme overrides applied. */
   templates: TemplateIndex;
+  /** `magento.inheritPlugins` from the project's `codegraph.json`. */
+  inheritPlugins: boolean;
 }
 
 const cache = new WeakMap<ResolutionContext, MagentoProject>();
@@ -50,6 +53,7 @@ export function getMagentoProject(context: ResolutionContext): MagentoProject {
     config: buildDiConfig(context, modules),
     modulePaths,
     templates: buildTemplateIndex(modulePaths, context.getAllFiles()),
+    inheritPlugins: loadMagentoInheritPlugins(context.getProjectRoot()),
   };
   cache.set(context, project);
   cachedContexts.push(context);

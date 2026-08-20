@@ -19,7 +19,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - GitHub Copilot is now a supported agent: `codegraph install` can configure Copilot Chat in VS Code (`copilot-vscode`), the GitHub Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`). Installed Copilot surfaces are auto-detected like every other agent, existing MCP server entries in their config files are preserved, and `codegraph uninstall` reverses the setup cleanly. Restart VS Code or your JetBrains IDE after installing so Copilot picks up the server.
 
+- Magento plugins are now reported on every class that inherits them, the way Magento's own interception works: a plugin declared on an abstract block or a framework interface shows up on each concrete class below it, so asking what wraps a controller's `execute` finally names the store-check and design-loader plugins that really run. This needs the classes those plugins target to be in the index, which for most stores means `vendor/` — a store that indexes only `app/code` sees no change. Turn it off per project with `{ "magento": { "inheritPlugins": false } }` in `codegraph.json`. Re-index after upgrading to pick up the new edges.
+
 ### Fixes
+
+- Magento's plugin merge now follows the same rules the platform's own configuration mapper does, so a later declaration that only re-points a plugin no longer silently re-enables one an earlier module had switched off.
 
 - A project that keeps its code behind a directory symlink — a `current` pointer aimed at one of several checkouts, a shortcut into a subfolder — is no longer indexed under the symlink's name. Both names lead to the same files, only one of them could be kept, and which one won came down to the order the operating system happened to list the directory in. When the symlink won, every path in the index pointed somewhere the code does not live, and repointing that symlink at another checkout silently made the whole index describe a different tree. The real path now always wins; a symlink is still followed when nothing else reaches its target, so a link out of the project keeps working exactly as before. Only projects without git were affected.
 

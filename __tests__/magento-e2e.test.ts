@@ -14,6 +14,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodeGraph } from '../src';
 import { clearMagentoConfigCache } from '../src/resolution/frameworks/magento/config';
+import { clearProjectConfigCache } from '../src/project-config';
 
 function write(root: string, relative: string, content: string): void {
   const full = path.join(root, relative);
@@ -654,6 +655,99 @@ describe('Magento end-to-end', () => {
 
     const sequenceEdge = cg.getOutgoingEdges(catalog!.id).find((e) => e.target === base!.id);
     expect(sequenceEdge).toBeDefined();
+
+    cg.close();
+  }, 60_000);
+});
+
+/**
+ * Interception runs down the hierarchy, so a plugin on a base class also wraps
+ * the subclass that overrides the intercepted method. This is only visible when
+ * both ends are indexed — on a store that leaves `vendor/` out, the plugins it
+ * declares target core classes and nothing propagates.
+ */
+describe('Magento plugin inheritance', () => {
+  let tmpDir: string | undefined;
+
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+    clearMagentoConfigCache();
+    clearProjectConfigCache();
+  });
+
+  function buildHierarchy(root: string): void {
+    write(root, 'composer.json', JSON.stringify({ require: { 'magento/product-community-edition': '2.4.7' } }));
+    write(root, 'app/code/Acme/M/registration.php', '<?php\n');
+    write(
+      root,
+      'app/code/Acme/M/etc/module.xml',
+      '<?xml version="1.0"?>\n<config><module name="Acme_M"/></config>\n',
+    );
+    write(
+      root,
+      'app/code/Acme/M/etc/di.xml',
+      `<?xml version="1.0"?>
+<config>
+    <type name="Acme\\M\\Model\\Base">
+        <plugin name="acme_base" type="Acme\\M\\Plugin\\BasePlugin"/>
+    </type>
+</config>
+`,
+    );
+    write(
+      root,
+      'app/code/Acme/M/Model/Base.php',
+      '<?php\nnamespace Acme\\M\\Model;\n\nclass Base\n{\n    public function save() { return 1; }\n}\n',
+    );
+    write(
+      root,
+      'app/code/Acme/M/Model/Child.php',
+      '<?php\nnamespace Acme\\M\\Model;\n\nclass Child extends Base\n{\n    public function save() { return 2; }\n}\n',
+    );
+    write(
+      root,
+      'app/code/Acme/M/Plugin/BasePlugin.php',
+      '<?php\nnamespace Acme\\M\\Plugin;\n\nclass BasePlugin\n{\n    public function beforeSave($subject) { return null; }\n}\n',
+    );
+  }
+
+  const interceptedClasses = (cg: CodeGraph): string[] => {
+    const plugin = cg
+      .getNodesByKind('method')
+      .find((n) => n.name === 'beforeSave' && n.filePath.endsWith('Plugin/BasePlugin.php'));
+    return cg
+      .getNodesByKind('method')
+      .filter((n) => n.name === 'save')
+      .filter((n) =>
+        cg
+          .getOutgoingEdges(n.id)
+          .some((e) => e.target === plugin!.id && e.metadata?.synthesizedBy === 'magento-plugin'),
+      )
+      .map((n) => path.basename(n.filePath));
+  };
+
+  it('wraps the subclass that overrides an intercepted method', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-magento-'));
+    buildHierarchy(tmpDir);
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(interceptedClasses(cg).sort()).toEqual(['Base.php', 'Child.php']);
+
+    cg.close();
+  }, 60_000);
+
+  it('reports only the declaring class when the project turns inheritance off', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-magento-'));
+    buildHierarchy(tmpDir);
+    write(tmpDir, 'codegraph.json', JSON.stringify({ magento: { inheritPlugins: false } }));
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    expect(interceptedClasses(cg)).toEqual(['Base.php']);
 
     cg.close();
   }, 60_000);

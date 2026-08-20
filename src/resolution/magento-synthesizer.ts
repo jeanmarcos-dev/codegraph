@@ -28,6 +28,7 @@ import type { MaybeYield } from './cooperative-yield';
 import { getMagentoProject } from './frameworks/magento/config';
 import {
   pluginsFor,
+  pluginInheritance,
   resolvePreference,
   resolveType,
   preferenceSite,
@@ -219,31 +220,90 @@ function interceptedMethodName(pluginMethod: string): string | null {
   return null;
 }
 
+/** A node's Magento FQCN — the qualified name with its last `::` back to `\`. */
+function fqcnOf(node: Node): string {
+  return node.qualifiedName.replace(/::(?=[^:]*$)/, '\\');
+}
+
+/**
+ * Every type the plugin pass has to ask about.
+ *
+ * Interception runs down the hierarchy, so a class inherits the plugins of its
+ * ancestors — but asking that of every indexed class is wasted work on a store
+ * where almost nothing is intercepted. Only a type that has a declared target
+ * somewhere above it can gain anything, so the walk happens once here and the
+ * per-area loop stays on that set.
+ */
+function pluginCandidates(
+  context: ResolutionContext,
+  config: MagentoConfig,
+  parentsOf: (type: string) => string[],
+): Set<string> {
+  const declared = new Set<string>();
+  for (const byTarget of config.plugins.values()) for (const target of byTarget.keys()) declared.add(target);
+
+  const candidates = new Set<string>(declared);
+  const verdicts = new Map<string, boolean>();
+
+  const inherits = (type: string): boolean => {
+    const known = verdicts.get(type);
+    if (known !== undefined) return known;
+    verdicts.set(type, false); // cycle guard, replaced below
+    const answer = parentsOf(type).some((parent) => declared.has(parent) || inherits(parent));
+    verdicts.set(type, answer);
+    return answer;
+  };
+
+  for (const kind of ['class', 'interface'] as const) {
+    for (const node of iterateKind(context, kind)) {
+      const fqcn = fqcnOf(node);
+      if (!candidates.has(fqcn) && inherits(fqcn)) candidates.add(fqcn);
+    }
+  }
+  return candidates;
+}
+
 /**
  * `<plugin>` — intercepted method → each plugin method wrapping it.
  *
  * A plugin declared on an interface also wraps whatever the preference
  * resolves that interface to, so both target nodes are linked when both are
- * indexed.
+ * indexed. Unless `magento.inheritPlugins` is turned off, a type also collects
+ * the plugins its ancestors declare — `storeCheck` on
+ * `Magento\Framework\App\Action\Action` really does run on every controller.
  */
 export async function magentoPluginEdges(
   queries: MagentoQueries,
   context: ResolutionContext,
   onYield: MaybeYield,
 ): Promise<Edge[]> {
-  const { modules, config } = getMagentoProject(context);
+  const { modules, config, inheritPlugins } = getMagentoProject(context);
   if (modules.size === 0) return [];
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
+  const parentsOf = (type: string): string[] => {
+    const node = typeNode(queries, type);
+    if (!node) return [];
+    return queries
+      .getOutgoingEdges(node.id, ['extends', 'implements'])
+      .map((edge) => queries.getNodeById(edge.target))
+      .filter((n): n is Node => n !== null && (n.kind === 'class' || n.kind === 'interface'))
+      .map(fqcnOf);
+  };
+  const inheritance = inheritPlugins ? pluginInheritance(parentsOf) : undefined;
+  const targets = inheritance
+    ? pluginCandidates(context, config, parentsOf)
+    : null;
+
   for (const area of areasOf(config)) {
     const byTarget = config.plugins.get(area);
     if (!byTarget) continue;
 
-    for (const target of byTarget.keys()) {
+    for (const target of targets ?? byTarget.keys()) {
       await onYield();
-      const plugins = pluginsFor(config, target, area);
+      const plugins = pluginsFor(config, target, area, inheritance);
       if (plugins.length === 0) continue;
 
       const targetNames = new Set<string>([target, resolveType(config, target, area)]);

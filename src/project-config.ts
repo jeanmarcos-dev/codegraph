@@ -67,6 +67,18 @@ export interface ProjectConfig {
    * wins. Absent/empty (the default) forces nothing in.
    */
   include?: string[];
+  /** Magento-specific resolution switches. */
+  magento?: {
+    /**
+     * Follow the class hierarchy when collecting `<plugin>` declarations, the
+     * way Magento's own interception does — so a plugin declared on an abstract
+     * block or a framework interface is reported on every concrete class below
+     * it. On (the default) it costs nothing unless the classes those plugins
+     * target are indexed, which for most stores means `vendor/` is in the
+     * index. Set false to report only what a type declares itself.
+     */
+     inheritPlugins?: boolean;
+  };
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -75,6 +87,7 @@ interface ParsedConfig {
   includeIgnored: string[];
   exclude: string[];
   include: string[];
+  magentoInheritPlugins: boolean;
 }
 
 interface CacheEntry {
@@ -97,6 +110,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
+  magentoInheritPlugins: true,
 });
 
 /**
@@ -149,15 +163,37 @@ function parseConfig(file: string): ParsedConfig {
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
+  const magentoInheritPlugins = extractBoolean(parsed, 'magento', 'inheritPlugins', true, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
-    include.length === 0
+    include.length === 0 &&
+    magentoInheritPlugins
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include };
+  return { extensions, includeIgnored, exclude, include, magentoInheritPlugins };
+}
+
+/** Read `section.key` as a boolean, warning and falling back on anything else. */
+function extractBoolean(
+  parsed: object,
+  section: string,
+  key: string,
+  fallback: boolean,
+  file: string,
+): boolean {
+  const group = (parsed as Record<string, unknown>)[section];
+  if (!group || typeof group !== 'object' || Array.isArray(group)) return fallback;
+  const value = (group as Record<string, unknown>)[key];
+  if (value === undefined) return fallback;
+  if (typeof value === 'boolean') return value;
+  logWarn(
+    `Ignoring ${section}.${key} in ${PROJECT_CONFIG_FILENAME}: expected true or false`,
+    { file },
+  );
+  return fallback;
 }
 
 /**
@@ -336,6 +372,9 @@ export function loadExcludePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+export function loadMagentoInheritPlugins(rootDir: string): boolean {
+  return loadParsedConfig(rootDir).magentoInheritPlugins;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
