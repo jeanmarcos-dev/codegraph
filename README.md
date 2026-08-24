@@ -55,6 +55,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 - [Key Features](#key-features)
 - [Framework-aware Routes](#framework-aware-routes)
 - [Mixed iOS / React Native / Expo bridging](#mixed-ios--react-native--expo-bridging)
+- [Magento 2 / Adobe Commerce](#magento-2--adobe-commerce)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
 - [CLI Reference](#cli-reference)
@@ -279,8 +280,9 @@ CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScr
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
 | **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
-| **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
+| **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 18 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
+| **Magento 2 / Adobe Commerce** | Reproduces Magento's own `di.xml` merge so preferences, plugins, factories, injected arguments, events, controllers and templates connect — the decision layer that lives in XML, not PHP |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
 
 <details>
@@ -324,6 +326,7 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Express** | `app.get(...)`, `router.post(...)` with middleware chains |
 | **NestJS** | `@Controller` + `@Get/@Post/...`, GraphQL `@Resolver` + `@Query/@Mutation`, `@MessagePattern`/`@EventPattern`, `@SubscribeMessage` |
 | **Laravel** | `Route::get()`, `Route::resource()`, `Controller@action`, tuple syntax |
+| **Magento 2 / Adobe Commerce** | `webapi.xml` endpoints, controller front names from `routes.xml`, `crontab.xml` jobs, `queue_consumer.xml` consumers |
 | **Drupal** | `*.routing.yml` routes (`_controller`, `_form`, entity handlers); `hook_*` implementations in `.module`/`.theme`/`.install`/`.inc` |
 | **Rails** | `get '/x', to: 'users#index'`, hash-rocket `=>` syntax |
 | **Spring** | `@GetMapping`, `@PostMapping`, `@RequestMapping` on methods |
@@ -364,6 +367,65 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | Fabric / Paper views | [react-native-segmented-control](https://github.com/react-native-segmented-control/segmented-control) | [react-native-screens](https://github.com/software-mansion/react-native-screens) | [react-native-skia](https://github.com/Shopify/react-native-skia) |
 
 Each bridge emits edges tagged `provenance:'heuristic'` with `metadata.synthesizedBy:` set to a stable channel name (e.g. `swift-objc-bridge`, `rn-event-channel`, `fabric-native-impl`, `expo-module-extract`), so the agent can tell at a glance how a hop got into the graph.
+
+---
+
+## Magento 2 / Adobe Commerce
+
+Magento decides almost nothing in PHP. The class behind an interface is chosen by a `<preference>`, the code wrapping a method is compiled into a generated `Interceptor`, `->create()` builds a factory class that exists in no file you can open, observers are matched to events by a bare string, and a template is bound to its block by layout XML. Static extraction sees none of that, so a store's graph stops dead at every one of those boundaries. CodeGraph reproduces Magento's own configuration merge instead — modules discovered from their `etc/module.xml` and ordered by `sequence`, then every `di.xml` merged in that order with area layering — so a `<preference>` resolves to the class the *last* module wins with, not the first one found on disk.
+
+| Pass | Connects | `synthesizedBy` |
+|---|---|---|
+| **Preference** | interface method → the method that really runs | `magento-preference` |
+| **Plugin** | intercepted method → each `before` / `around` / `after` wrapping it, honoring `sortOrder` and `disabled` | `magento-plugin` |
+| **DI argument** | constructor → the class configuration injects, array items included — how every composite and pool is wired | `magento-di-argument` |
+| **Factory** | `$this->xFactory->create()` → the class it builds | `magento-factory` |
+| **Event** | `dispatch('name')` → the event → every observer bound to it | `magento-event` |
+| **Controller** | front name → the action classes serving it | `magento-controller` |
+| **Template** | `.phtml` / `.twig` `$block->getX()` → the block or view-model method layout XML binds | `magento-template` |
+
+Nodes reuse existing kinds — `module`, `route` (Web API, front name, cron, consumer), `component` (layout block, UI component), `function` (event) — so nothing about the graph schema changes.
+
+**Every pass is gated on both ends being indexed.** `vendor/` is skipped by default, so a plugin on a core class emits nothing rather than a guess — silent beats wrong. To index the core, add a `.gitignore` negation (`!vendor/`); a repo like `magento/magento2`, which keeps its modules under `app/code`, needs no special handling. Plugins declared on an abstract class or a framework interface are reported on every concrete class below them, the way interception really works — turn that off with `{ "magento": { "inheritPlugins": false } }`.
+
+**Recommended `codegraph.json` for a store.** A store installed from the Magento distribution rather than cloned carries no `.gitignore`, so generated output, static assets and test fixtures otherwise swamp the graph:
+
+```json
+{
+  "exclude": [
+    "app/etc/**",
+    "generated/**",
+    "var/**",
+    "pub/static/**",
+    "pub/media/**",
+    "pub/errors/**",
+    "dev/tests/**",
+    "dev/tools/**",
+    "setup/**",
+    "lib/web/**",
+    "**/Test/Mftf/**"
+  ]
+}
+```
+
+Two of those are about correctness rather than noise: `app/etc` holds credentials in `env.php`, and `generated/` contains the very `Interceptor`, `Factory` and `Proxy` classes the passes above synthesize from `di.xml` — indexing them puts a second, competing definition of every intercepted class in the graph. Index the Magento root itself (the directory with `composer.json`, `app/` and `bin/magento`), not a parent directory that rotates a symlink at several checkouts.
+
+### MageObsidian (Vite / Tailwind / Vue frontend)
+
+MageObsidian keeps native layouts and blocks but replaces Luma and RequireJS with Vite, Tailwind and Vue — so the PHP half is ordinary Magento while the entire view layer is invisible to static extraction. Every cross-module import is written `Vendor_Module::path` (a relative one bypasses theme inheritance and the build rejects it), which names no path on disk; those resolve through the theme chain exactly as the build resolves them, a child theme's override beating its parent's and the parent's beating the module's.
+
+| Connects | `synthesizedBy` |
+|---|---|
+| `Vendor_Module::path` import → the theme-resolved asset | `obsidian-import` |
+| Twig `include` / `extends` / `embed` → the template it pulls in | `obsidian-twig-include` |
+| `render_vue('Vendor_Module::…')` → the Vue island component | `obsidian-island` |
+| `script('Vendor_Module::…')` → the entry it loads | `obsidian-twig-script` |
+| Twig `block.getFoo()` / `viewModel.foo()` → the block or view-model method | `obsidian-twig-block` |
+| a JS/TS read of a PHP config constant → the constant declaring it | `obsidian-contract` |
+
+`.twig` templates get a symbol of their own, and their block bindings reuse the Magento layout pass above, so one implementation serves both `.phtml` and `.twig`.
+
+Design notes: [`docs/design/magento-di-resolution.md`](docs/design/magento-di-resolution.md) and [`docs/design/mage-obsidian.md`](docs/design/mage-obsidian.md).
 
 ---
 
@@ -777,7 +839,7 @@ is written):
 | Rust | `.rs` | Full support |
 | Java | `.java` | Full support |
 | C# | `.cs` | Full support |
-| PHP | `.php` | Full support |
+| PHP | `.php`, `.phtml` | Full support (`.phtml` theme templates parse as mixed HTML/PHP, so their `$block->getX()` / view-model callsites are real references — see [Magento 2 / Adobe Commerce](#magento-2--adobe-commerce)) |
 | Ruby | `.rb` | Full support |
 | C | `.c`, `.h` | Full support |
 | C++ | `.cpp`, `.hpp`, `.cc` | Full support |
@@ -834,6 +896,8 @@ Impact and blast-radius queries are only as good as the dependency graph behind 
 | Pascal / Delphi | PascalCoin | 77.4% |
 
 Framework routing is validated the same way, on a canonical app per framework: Express 100%, FastAPI 98%, Flask 100%, NestJS 96.8%, Gin 96.5%, Axum 100%, Rocket 93.8%, Vapor 100%, Laravel 92%, Rails 89.6%, React Router 100% — and the convention/reflection-heavy ones at their honest static-analysis ceiling: ASP.NET 83.9%, Spring 83.3%, Drupal 78.9%, Play 76.3%, Django 74.1%. SvelteKit, Vue/Nuxt, and Astro use file-based routing, so their page/endpoint coverage is the Svelte/SvelteKit (100%), Vue/Nuxt (93.5%), and Astro (93.0% — every `src/pages/` file maps to a route node on the two validation repos) figures in the table above.
+
+Magento is validated against the platform's own compiled output rather than a benchmark app: `setup:di:compile` writes the fully merged, area-resolved configuration the runtime actually reads, so the resolver's answers are diffed against it entry by entry. On Magento 2.4.7 vanilla and an Adobe Commerce 2.4.7 install of 805 modules, that comes out at **85.0–88.8%** of preferences, **85.6–89.3%** of virtual types, **99.0–99.8%** of declared plugins and **95.8–99.9%** of inherited ones. Extraction itself is exact on `magento/magento2`: 278/278 modules, 403/403 Web API routes, 54/54 cron jobs and 31/31 consumers that declare a handler. MageObsidian's `Vendor_Module::path` resolution is complete on the real source — 37/37 distinct specifiers across 118/118 call sites.
 
 ## Troubleshooting
 
