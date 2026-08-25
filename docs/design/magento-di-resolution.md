@@ -149,7 +149,9 @@ store’s own code** — 1.2%. The same tree with these exclusions scans **199**
 Two entries are about correctness rather than noise:
 
 - `app/etc` — `env.php` holds credentials and `config.php` is a module list,
-  not code.
+  not code. Excluding the directory costs nothing: `app/etc/di.xml` and
+  `app/etc/config.php` are read by path rather than through the index, and
+  `env.php` is never read at all.
 - `generated` — these are the `Interceptor`, `Factory` and `Proxy` classes
   Magento writes at runtime, which is exactly what the passes above synthesize
   from `di.xml`. Indexing them puts a second, competing definition of every
@@ -203,36 +205,55 @@ intercepts a concrete class. The harness supplies the hierarchy by resolving
 each type through Composer's generated PSR-4 map and reading the declaration at
 the top of its file; the resolver gets the same hierarchy from the graph.
 
-Measured on two stores:
+Measured on a Magento 2.4.7 install, every comparison exact:
 
-| | Adobe Commerce 2.4.7, 805 modules | Magento 2.4.7 vanilla |
-|---|---|---|
-| Preferences | 1676/1888 · 88.8% | 1202/1414 · 85.0% |
-| Virtual types | 803/899 · 89.3% | 693/810 · 85.6% |
-| Plugins, declared | 99.0–99.4% per area | 99.8% per area |
-| Plugins, inherited | 95.8–99.5% per area | 99.8–99.9% per area |
+| | Agreement |
+|---|---|
+| Preferences | 1414/1414 · 100% |
+| Virtual types | 810/810 · 100% |
+| Plugins, declared | 100% in all 7 area chains |
+| Plugins, inherited | 100% in all 7 area chains |
 
-The residue is understood, not mysterious:
+Three rules had to be read from framework source to get there, and each one was
+worth a measurable jump:
 
 - **The `primary` scope.** `app/etc/di.xml` loads before every module's, and a
   stock one carries ~228 preferences (`DateTimeInterface`, the Redis session
-  handlers, the ACL cache). `moduleOf()` returns nothing for a file outside a
-  module, so we drop all of them. That is most of the preference gap.
-- **Disabled modules.** Load order comes from `app/etc/config.php`:
-  `ModuleList::getNames()` is `array_keys(array_filter($configData))`, and that
-  filter drops disabled modules. We reproduce `sortBySequence()` instead, which
-  `Module\Dir\Reader::getFiles()` never calls, and we cannot tell which modules
-  are off. On the store with 30 disabled modules that costs 5 wrong preference
-  winners and ~35 plugins per area that Magento never runs; the vanilla install,
-  where nothing is disabled, reports zero extra plugins — which is what pins the
-  diagnosis.
-- **Inheritance.** What remains is one documented Magento quirk rather than a
-  rule we skipped: `inheritPlugins()` caches the *unfiltered* plugin set on a
-  type but returns the *filtered* one, so the first descendant to trigger an
-  ancestor's resolution sees a disabled plugin removed while every later
-  descendant reads the cache and keeps it. Two classes with identical ancestry
-  end up intercepted differently. We report the intended semantics — a disabled
-  plugin does not fire — rather than emulating the compiler's visiting order.
+  handlers, the ACL cache). It belongs to no module, so the module-owned walk
+  skipped it and every one of those was missing — 85% → 99.9% of preferences on
+  its own. It is read by path; `env.php` sits in the same directory and is never
+  read, so credentials never enter the process.
+- **The load order is `app/etc/config.php`, not `<sequence>`.**
+  `Module\Dir\Reader::getFiles()` iterates `ModuleList::getNames()`, which is
+  `array_keys(array_filter($configData))` — the file's key order, with disabled
+  modules filtered out. `sortBySequence()` is never called on that path. It is
+  now the fallback for a tree with no `config.php` at all (a standalone module
+  repository, or a checkout that was never installed).
+- **`getOriginalInstanceType`.** A virtual type's `type` is routinely another
+  virtual type, and the compiled map names the class at the end of that chain.
+  Walking it took virtual types from 85.6% to 100%.
+
+Two consequences of following `config.php` are worth stating, because they are
+deliberate:
+
+- **A disabled module contributes nothing** — no preference of its can win a
+  merge Magento never performed. On a store with 74 modules disabled that
+  removed 5 wrong preference winners and ~33 plugins per area that never run.
+- **A module on disk the file does not list is treated as disabled**, as Magento
+  does. On two real stores that set was 60–73 modules and dominated by test
+  fixtures shipped inside `vendor` (`Magento_A`, `Acme_Exploditron`,
+  `Magento_FirstModule`) — which is exactly what should stay out of the graph.
+  The cost is that a module you just created does not appear until
+  `setup:upgrade` adds it to `config.php`; a tree with no `config.php` keeps
+  every module, so developing a module standalone is unaffected.
+
+**Inheritance** is exact except for one documented Magento quirk:
+`inheritPlugins()` caches the *unfiltered* plugin set on a type but returns the
+*filtered* one, so the first descendant to trigger an ancestor's resolution sees
+a disabled plugin removed while every later descendant reads the cache and keeps
+it. Two classes with identical ancestry end up intercepted differently. We report
+the intended semantics — a disabled plugin does not fire — rather than emulating
+the compiler's visiting order.
 
 An `X => X\Interceptor` entry in the compiled preference map is interception
 routing, not a declared preference — the harness folds it away, and we must
