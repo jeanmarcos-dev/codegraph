@@ -306,6 +306,26 @@ and edge totals. The store declares 197 plugin targets, 25 of them indexed, and
 core classes, and its own classes do not descend from the classes it intercepts.
 So the switch matters only once the core is in the index.
 
+### When the intercepted ancestor is not indexed
+
+Inheritance matches on names, not nodes, which lets one more case connect: a
+store's class implementing a Magento *core* interface that `vendor/` exclusion
+leaves out, with the `<plugin>` on that interface declared in `app/code`. The
+graph carries no `implements` edge — an edge needs both ends indexed — so the
+parent's name is read from the class's own declaration (`php-parents.ts`),
+union'd with whatever the graph did resolve.
+
+The yield is modest and worth stating plainly. On a 190-module store indexed
+without `vendor/`: **15** indexed classes declare a parent that is an
+un-indexed plugin target, and **4** of those also define the intercepted method
+themselves — the rest inherit it from an ancestor that is equally absent, so
+there is no method node to attach an edge to. Index time is unchanged (8.1s
+against 7.9s, run-to-run noise).
+
+A first estimate put this at 217 classes by matching parents on their last path
+segment alone; the real figure is 15. Matching a class by short name is not
+matching a class.
+
 ## Frontier
 
 - **Interceptor chains between plugins.** Plugin ordering is modelled
