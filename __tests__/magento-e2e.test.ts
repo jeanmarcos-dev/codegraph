@@ -739,6 +739,78 @@ describe('Magento plugin inheritance', () => {
     cg.close();
   }, 60_000);
 
+  // The case a real store hits: the plugin targets a Magento core interface that
+  // `vendor/` exclusion leaves out of the index, and the store's own class
+  // implements it. The interface has no node, so the graph carries no
+  // `implements` edge — the parent name has to come from the source.
+  it('wraps a class whose intercepted ancestor is not indexed', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-magento-'));
+    write(tmpDir, 'composer.json', JSON.stringify({ require: { 'magento/product-community-edition': '2.4.7' } }));
+    write(tmpDir, 'app/code/Acme/M/registration.php', '<?php\n');
+    write(
+      tmpDir,
+      'app/code/Acme/M/etc/module.xml',
+      '<?xml version="1.0"?>\n<config><module name="Acme_M"/></config>\n',
+    );
+    write(
+      tmpDir,
+      'app/code/Acme/M/etc/di.xml',
+      `<?xml version="1.0"?>
+<config>
+    <type name="Magento\\Catalog\\Api\\ProductRepositoryInterface">
+        <plugin name="acme_on_core" type="Acme\\M\\Plugin\\CorePlugin"/>
+    </type>
+</config>
+`,
+    );
+    write(
+      tmpDir,
+      'app/code/Acme/M/Model/Repo.php',
+      `<?php
+namespace Acme\\M\\Model;
+
+use Magento\\Catalog\\Api\\ProductRepositoryInterface;
+
+class Repo implements ProductRepositoryInterface
+{
+    public function save($product) { return $product; }
+}
+`,
+    );
+    write(
+      tmpDir,
+      'app/code/Acme/M/Plugin/CorePlugin.php',
+      `<?php
+namespace Acme\\M\\Plugin;
+
+class CorePlugin
+{
+    public function beforeSave($subject, $product) { return [$product]; }
+}
+`,
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const save = cg
+      .getNodesByKind('method')
+      .find((n) => n.name === 'save' && n.filePath.endsWith('Model/Repo.php'));
+    const plugin = cg
+      .getNodesByKind('method')
+      .find((n) => n.name === 'beforeSave' && n.filePath.endsWith('Plugin/CorePlugin.php'));
+    expect(save, 'the store class is indexed').toBeDefined();
+
+    expect(
+      cg
+        .getOutgoingEdges(save!.id)
+        .some((e) => e.target === plugin!.id && e.metadata?.synthesizedBy === 'magento-plugin'),
+      'the plugin on the unindexed interface reaches the class implementing it',
+    ).toBe(true);
+
+    cg.close();
+  }, 60_000);
+
   it('reports only the declaring class when the project turns inheritance off', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-magento-'));
     buildHierarchy(tmpDir);

@@ -42,6 +42,7 @@ import {
   TEMPLATE_REF_PREFIX,
 } from './frameworks/magento/names';
 import { collectFrontNames } from './frameworks/magento/config-xml';
+import { declaredParents } from './frameworks/magento/php-parents';
 import { extractLayout, lookupTemplate } from './frameworks/magento/layout';
 
 /** The QueryBuilder surface these passes need. */
@@ -283,14 +284,36 @@ export async function magentoPluginEdges(
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
+  // Parents from the graph, unioned with the ones the class DECLARES. The graph
+  // only carries an `extends`/`implements` edge when both ends are indexed, and
+  // a store's classes routinely implement a core interface that lives in the
+  // unindexed `vendor/` tree — while the `<plugin>` on that interface is
+  // declared right there in `app/code`. Inheritance matches on names, so the
+  // declared name is all that was missing.
+  const parentCache = new Map<string, string[]>();
   const parentsOf = (type: string): string[] => {
+    const cached = parentCache.get(type);
+    if (cached) return cached;
+    parentCache.set(type, []);
+
     const node = typeNode(queries, type);
     if (!node) return [];
-    return queries
+    const parents = queries
       .getOutgoingEdges(node.id, ['extends', 'implements'])
       .map((edge) => queries.getNodeById(edge.target))
       .filter((n): n is Node => n !== null && (n.kind === 'class' || n.kind === 'interface'))
       .map(fqcnOf);
+
+    if (node.filePath.endsWith('.php')) {
+      const source = context.readFile(node.filePath);
+      if (source) {
+        for (const declared of declaredParents(source, node.name)) {
+          if (!parents.includes(declared)) parents.push(declared);
+        }
+      }
+    }
+    parentCache.set(type, parents);
+    return parents;
   };
   const inheritance = inheritPlugins ? pluginInheritance(parentsOf) : undefined;
   const targets = inheritance
