@@ -16,7 +16,7 @@
 
 import type { ResolutionContext } from '../../types';
 import { loadMagentoInheritPlugins } from '../../../project-config';
-import { discoverModules, sortModules, type MagentoModule } from './modules';
+import { discoverModules, sortModules, readModuleConfig, type MagentoModule } from './modules';
 import { buildDiConfig, type MagentoConfig } from './di';
 import { buildTemplateIndex, type TemplateIndex } from './layout';
 
@@ -46,7 +46,7 @@ export function getMagentoProject(context: ResolutionContext): MagentoProject {
   if (cached) return cached;
 
   const modules = discoverModules(context);
-  sortModules(modules);
+  sortModules(modules, readModuleConfig(context));
   const modulePaths = new Map([...modules].map(([name, module]) => [name, module.path]));
   const project: MagentoProject = {
     modules,

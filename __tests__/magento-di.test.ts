@@ -22,11 +22,16 @@ import {
   buildDiConfig,
   resolvePreference,
   resolveType,
+  resolveInstanceType,
   pluginsFor,
   pluginInheritance,
   objectArgumentsFor,
 } from '../src/resolution/frameworks/magento/di';
-import { discoverModules, sortModules } from '../src/resolution/frameworks/magento/modules';
+import {
+  discoverModules,
+  sortModules,
+  readModuleConfig,
+} from '../src/resolution/frameworks/magento/modules';
 import type { ResolutionContext } from '../src/resolution/types';
 
 function makeContext(files: Record<string, string>): ResolutionContext {
@@ -54,7 +59,7 @@ function moduleXml(name: string, sequence: string[] = []): string {
 function build(files: Record<string, string>) {
   const ctx = makeContext(files);
   const modules = discoverModules(ctx);
-  sortModules(modules);
+  sortModules(modules, readModuleConfig(ctx));
   return buildDiConfig(ctx, modules);
 }
 
@@ -671,5 +676,182 @@ describe('plugin attribute merge', () => {
 
     expect(pluginsFor(config, 'Acme\\Target', 'global')[0]!.sortOrder).toBe(50);
     expect(pluginsFor(config, 'Acme\\Target', 'frontend')[0]!.sortOrder).toBe(0);
+  });
+});
+
+/**
+ * `app/etc/config.php` — the real load order.
+ *
+ * `Module\Dir\Reader::getFiles()` iterates `ModuleList::getNames()`, which is
+ * `array_keys(array_filter($configData))`: the persisted key order of
+ * `config.php`, with disabled modules filtered out. Reproducing
+ * `sortBySequence()` instead — which that path never calls — puts the wrong
+ * module last, and counting a disabled module as active lets it win a merge
+ * Magento never performed.
+ */
+describe('module load order from config.php', () => {
+  const configPhp = (entries: Record<string, number>) =>
+    `<?php\nreturn [\n    'modules' => [\n${Object.entries(entries)
+      .map(([name, on]) => `        '${name}' => ${on}`)
+      .join(',\n')}\n    ]\n];\n`;
+
+  const project = (entries: Record<string, number> | null, extra: Record<string, string> = {}) => {
+    const files: Record<string, string> = {
+      'app/code/Acme/First/etc/module.xml': moduleXml('Acme_First'),
+      'app/code/Acme/Second/etc/module.xml': moduleXml('Acme_Second'),
+      ...extra,
+    };
+    if (entries) files['app/etc/config.php'] = configPhp(entries);
+    return files;
+  };
+
+  const orderOf = (files: Record<string, string>) => {
+    const ctx = makeContext(files);
+    const modules = discoverModules(ctx);
+    return sortModules(modules, readModuleConfig(ctx)).map((m) => m.name);
+  };
+
+  it('follows the key order of config.php, not the alphabetical sequence walk', () => {
+    expect(orderOf(project({ Acme_Second: 1, Acme_First: 1 }))).toEqual([
+      'Acme_Second',
+      'Acme_First',
+    ]);
+  });
+
+  it('drops a module config.php disables', () => {
+    expect(orderOf(project({ Acme_First: 1, Acme_Second: 0 }))).toEqual(['Acme_First']);
+  });
+
+  it('drops a module on disk that config.php never lists', () => {
+    expect(orderOf(project({ Acme_First: 1 }))).toEqual(['Acme_First']);
+  });
+
+  it('falls back to the sequence walk when there is no config.php', () => {
+    expect(orderOf(project(null))).toEqual(['Acme_First', 'Acme_Second']);
+  });
+
+  it('reads the legacy array() syntax', () => {
+    const files = project(null);
+    files['app/etc/config.php'] = "<?php\nreturn array(\n 'modules' => array(\n 'Acme_Second' => 1,\n 'Acme_First' => 1,\n )\n);\n";
+    expect(orderOf(files)).toEqual(['Acme_Second', 'Acme_First']);
+  });
+
+  it('ignores a preference declared by a disabled module', () => {
+    const config = build(
+      project({ Acme_First: 1, Acme_Second: 0 }, {
+        'app/code/Acme/First/etc/di.xml':
+          '<config><preference for="Acme\\ThingInterface" type="Acme\\First\\Thing"/></config>',
+        'app/code/Acme/Second/etc/di.xml':
+          '<config><preference for="Acme\\ThingInterface" type="Acme\\Second\\Thing"/></config>',
+      }),
+    );
+    expect(resolvePreference(config, 'Acme\\ThingInterface')).toBe('Acme\\First\\Thing');
+  });
+});
+
+/**
+ * `app/etc/di.xml` is the `primary` scope, loaded before every module's — it is
+ * where a stock install binds `DateTimeInterface`, the Redis session handlers
+ * and the ACL cache. It belongs to no module, so the module-owned walk skips it
+ * and it has to be read by path. `env.php` sits in the same directory and is
+ * never read: it carries database credentials.
+ */
+describe('primary scope (app/etc/di.xml)', () => {
+  it('applies a preference no module overrides', () => {
+    const config = build({
+      'app/etc/di.xml': '<config><preference for="DateTimeInterface" type="DateTime"/></config>',
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+    });
+    expect(resolvePreference(config, 'DateTimeInterface')).toBe('DateTime');
+  });
+
+  it('loses to a module that declares the same preference', () => {
+    const config = build({
+      'app/etc/di.xml':
+        '<config><preference for="Acme\\ThingInterface" type="Acme\\Primary\\Thing"/></config>',
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+      'app/code/Acme/M/etc/di.xml':
+        '<config><preference for="Acme\\ThingInterface" type="Acme\\M\\Thing"/></config>',
+    });
+    expect(resolvePreference(config, 'Acme\\ThingInterface')).toBe('Acme\\M\\Thing');
+  });
+
+  it('contributes plugins and virtual types too', () => {
+    const config = build({
+      'app/etc/di.xml': `<config>
+    <virtualType name="primaryVirtual" type="Acme\\Base"/>
+    <type name="Acme\\Target">
+        <plugin name="from_primary" type="Acme\\Plugin\\Primary"/>
+    </type>
+</config>`,
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+    });
+    expect(resolveInstanceType(config, 'primaryVirtual')).toBe('Acme\\Base');
+    expect(pluginsFor(config, 'Acme\\Target').map((p) => p.name)).toEqual(['from_primary']);
+  });
+
+  it('never reads env.php', () => {
+    const reads: string[] = [];
+    const files: Record<string, string> = {
+      'app/etc/di.xml': '<config/>',
+      'app/etc/env.php': "<?php return ['db' => ['password' => 'secret']];",
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+    };
+    const ctx = makeContext(files);
+    const spied: ResolutionContext = {
+      ...ctx,
+      readFile: (f: string) => {
+        reads.push(f);
+        return ctx.readFile(f);
+      },
+    };
+    const modules = discoverModules(spied);
+    sortModules(modules, readModuleConfig(spied));
+    buildDiConfig(spied, modules);
+    expect(reads).not.toContain('app/etc/env.php');
+  });
+});
+
+/**
+ * `getOriginalInstanceType` — a virtual type's `type` is routinely another
+ * virtual type, and what Magento instantiates is the class at the end of that
+ * chain. Preferences are deliberately NOT followed here: a virtual type
+ * resolves to the class it configures, and only then would a preference on that
+ * class apply.
+ */
+describe('resolveInstanceType', () => {
+  it('walks a chain of virtual types to the real class', () => {
+    const config = build({
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+      'app/code/Acme/M/etc/di.xml': `<config>
+    <virtualType name="outer" type="middle"/>
+    <virtualType name="middle" type="Acme\\Real"/>
+</config>`,
+    });
+    expect(resolveInstanceType(config, 'outer')).toBe('Acme\\Real');
+  });
+
+  it('ignores preferences on the class it lands on', () => {
+    const config = build({
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+      'app/code/Acme/M/etc/di.xml': `<config>
+    <virtualType name="alias" type="Acme\\ThingInterface"/>
+    <preference for="Acme\\ThingInterface" type="Acme\\Thing"/>
+</config>`,
+    });
+    expect(resolveInstanceType(config, 'alias')).toBe('Acme\\ThingInterface');
+    expect(resolveType(config, 'alias')).toBe('Acme\\Thing');
+  });
+
+  it('returns a plain class unchanged and terminates on a cycle', () => {
+    const config = build({
+      'app/code/Acme/M/etc/module.xml': moduleXml('Acme_M'),
+      'app/code/Acme/M/etc/di.xml': `<config>
+    <virtualType name="a" type="b"/>
+    <virtualType name="b" type="a"/>
+</config>`,
+    });
+    expect(resolveInstanceType(config, 'Acme\\Plain')).toBe('Acme\\Plain');
+    expect(resolveInstanceType(config, 'a')).toBe('b');
   });
 });

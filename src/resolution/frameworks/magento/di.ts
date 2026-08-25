@@ -30,6 +30,18 @@ import { moduleOf, pathWithinModule, type MagentoModule } from './modules';
 
 export const GLOBAL_AREA = 'global';
 
+/**
+ * `app/etc/di.xml` — the scope Magento loads before any module's, and the one a
+ * stock install uses to bind `DateTimeInterface`, the Redis session handlers and
+ * the ACL cache. It belongs to no module, so the module-owned walk skips it; it
+ * is read by path instead, and never enters the index (`app/etc` also holds
+ * `env.php`, which carries credentials and is never read).
+ */
+export const PRIMARY_AREA = 'primary';
+
+/** `app/etc/di.xml`, relative to the project root. */
+const PRIMARY_DI_FILE = 'app/etc/di.xml';
+
 /** Areas Magento loads `etc/<area>/di.xml` for. */
 export const DI_AREAS = [
   'frontend',
@@ -304,6 +316,9 @@ export function buildDiConfig(
     }
   };
 
+  const primary = context.readFile(PRIMARY_DI_FILE);
+  if (primary) mergeDiFile(config, primary, PRIMARY_DI_FILE, PRIMARY_AREA);
+
   merge((area) => area === GLOBAL_AREA);
   for (const area of DI_AREAS) merge((a) => a === area);
 
@@ -319,7 +334,8 @@ function preferenceEntry(
 ): MagentoPreference | undefined {
   return (
     (area !== GLOBAL_AREA ? config.preferences.get(area)?.get(name) : undefined) ??
-    config.preferences.get(GLOBAL_AREA)?.get(name)
+    config.preferences.get(GLOBAL_AREA)?.get(name) ??
+    config.preferences.get(PRIMARY_AREA)?.get(name)
   );
 }
 
@@ -359,7 +375,8 @@ function virtualTypeEntry(
 ): MagentoVirtualType | undefined {
   return (
     (area !== GLOBAL_AREA ? config.virtualTypes.get(area)?.get(name) : undefined) ??
-    config.virtualTypes.get(GLOBAL_AREA)?.get(name)
+    config.virtualTypes.get(GLOBAL_AREA)?.get(name) ??
+    config.virtualTypes.get(PRIMARY_AREA)?.get(name)
   );
 }
 
@@ -377,6 +394,30 @@ export function resolveType(
   for (let i = 0; i < MAX_CHAIN; i++) {
     const virtual = virtualTypeEntry(config, current, area)?.type;
     const next = virtual ?? preferenceEntry(config, current, area)?.type;
+    if (!next || seen.has(next)) break;
+    seen.add(next);
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * The real class a name instantiates — `getOriginalInstanceType`.
+ *
+ * A virtual type's `type` may name another virtual type, so the chain is walked
+ * until a real class is reached. Unlike `resolveType` this ignores preferences:
+ * a virtual type resolves to the class it configures, and only then would a
+ * preference on that class apply.
+ */
+export function resolveInstanceType(
+  config: MagentoConfig,
+  name: string,
+  area: string = GLOBAL_AREA,
+): string {
+  let current = normalizeClassName(name);
+  const seen = new Set<string>([current]);
+  for (let i = 0; i < MAX_CHAIN; i++) {
+    const next = virtualTypeEntry(config, current, area)?.type;
     if (!next || seen.has(next)) break;
     seen.add(next);
     current = next;
@@ -439,8 +480,12 @@ function declaredOn(
   area: string,
 ): Map<string, PluginDeclaration> {
   const merged = new Map<string, PluginDeclaration>();
-  for (const plugin of config.plugins.get(GLOBAL_AREA)?.get(name)?.values() ?? []) {
+  for (const plugin of config.plugins.get(PRIMARY_AREA)?.get(name)?.values() ?? []) {
     merged.set(plugin.name, plugin);
+  }
+  for (const plugin of config.plugins.get(GLOBAL_AREA)?.get(name)?.values() ?? []) {
+    const existing = merged.get(plugin.name);
+    merged.set(plugin.name, existing ? acrossScopes(existing, plugin) : plugin);
   }
   if (area !== GLOBAL_AREA) {
     for (const plugin of config.plugins.get(area)?.get(name)?.values() ?? []) {
@@ -533,7 +578,10 @@ export function objectArgumentsFor(
   area: string = GLOBAL_AREA,
 ): MagentoObjectArgument[] {
   const name = normalizeClassName(target);
-  const out = [...(config.objectArguments.get(GLOBAL_AREA)?.get(name) ?? [])];
+  const out = [
+    ...(config.objectArguments.get(PRIMARY_AREA)?.get(name) ?? []),
+    ...(config.objectArguments.get(GLOBAL_AREA)?.get(name) ?? []),
+  ];
   if (area !== GLOBAL_AREA) out.push(...(config.objectArguments.get(area)?.get(name) ?? []));
   return out;
 }

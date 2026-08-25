@@ -20,10 +20,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { describe, it, expect } from 'vitest';
-import { discoverModules, sortModules } from '../src/resolution/frameworks/magento/modules';
+import {
+  discoverModules,
+  sortModules,
+  readModuleConfig,
+} from '../src/resolution/frameworks/magento/modules';
 import {
   buildDiConfig,
   resolvePreference,
+  resolveInstanceType,
   pluginsFor,
   pluginInheritance,
 } from '../src/resolution/frameworks/magento/di';
@@ -36,7 +41,7 @@ const SKIP_ROOTS = new Set([
   'var', 'pub', 'generated', 'node_modules', '.git', 'dev', 'setup', '.pnpm-store',
 ]);
 
-const CONFIG_FILES = new Set(['di.xml', 'module.xml', 'registration.php']);
+const CONFIG_FILES = new Set(['di.xml', 'module.xml', 'registration.php', 'config.php']);
 
 function hasPhp(): boolean {
   try {
@@ -196,14 +201,15 @@ const compiledAreas = (): { area: string; file: string }[] => {
  */
 function buildFixture(root: string, meta: string) {
   const files = walkConfig(root);
-  const modules = discoverModules(diskContext(root, files));
-  sortModules(modules);
+  const context = diskContext(root, files);
+  const modules = discoverModules(context);
+  sortModules(modules, readModuleConfig(context));
   const newestSource = Math.max(...files.map((f) => f.mtimeMs));
   const oldestMetadata = Math.min(
     ...fs.readdirSync(meta).map((n) => fs.statSync(path.join(meta, n)).mtimeMs),
   );
   return {
-    config: buildDiConfig(diskContext(root, files), modules),
+    config: buildDiConfig(context, modules),
     fresh: oldestMetadata >= newestSource,
   };
 }
@@ -253,11 +259,7 @@ describe.runIf(META)('Magento DI vs compiled metadata', () => {
     const ratio = agreed / declared.size;
     report(`preferences        ${agreed}/${declared.size}`, ratio);
     expect(declared.size, 'the oracle carries preferences to compare').toBeGreaterThan(100);
-    // Below the floor sit two known gaps, both tracked: the `primary` scope
-    // (`app/etc/di.xml`) is not read, and modules disabled in `app/etc/config.php`
-    // are treated as active, so a preference of theirs can win a merge Magento
-    // never ran.
-    expect(ratio, `preference agreement ${(100 * ratio).toFixed(1)}%`).toBeGreaterThan(0.8);
+    expect(ratio, `preference agreement ${(100 * ratio).toFixed(1)}%`).toBeGreaterThan(0.99);
     // A wrong winner is worse than a missing one: it is a confident wrong answer.
     expect(disagreed.length / declared.size, disagreed.slice(0, 5).join('\n')).toBeLessThan(0.01);
   });
@@ -266,18 +268,21 @@ describe.runIf(META)('Magento DI vs compiled metadata', () => {
     const compiled = readPhpArray(
       `$d = require ${JSON.stringify(path.join(META!, 'global.php'))}; echo json_encode($d['instanceTypes'] ?? []);`,
     ) as Record<string, string>;
-    const ours = config.virtualTypes.get('global') ?? new Map();
-
+    // The compiled map names the type a virtual type finally INSTANTIATES, so
+    // the chain has to be walked on our side too — a virtual type's `type` is
+    // routinely another virtual type. Resolution also has to go through the
+    // scope chain (an `app/etc/di.xml` declaration is in `primary`, not
+    // `global`), which is what `resolveInstanceType` does.
     let agreed = 0;
     for (const [name, base] of Object.entries(compiled)) {
-      const mine = ours.get(normalize(name));
-      if (mine && stripInterceptor(mine.type) === stripInterceptor(base)) agreed++;
+      const mine = resolveInstanceType(config, normalize(name), 'global');
+      if (stripInterceptor(mine) === stripInterceptor(base)) agreed++;
     }
 
     const total = Object.keys(compiled).length;
     const ratio = agreed / total;
     report(`virtual types      ${agreed}/${total}`, ratio);
-    expect(ratio, `virtual type agreement ${(100 * ratio).toFixed(1)}%`).toBeGreaterThan(0.8);
+    expect(ratio, `virtual type agreement ${(100 * ratio).toFixed(1)}%`).toBeGreaterThan(0.99);
   });
 
   describe('plugins', () => {
@@ -330,7 +335,7 @@ describe.runIf(META)('Magento DI vs compiled metadata', () => {
         expect(
           agreed / bindings,
           `${area}: declared plugin agreement ${agreed}/${bindings}\n${samples.join('\n')}`,
-        ).toBeGreaterThan(0.97);
+        ).toBeGreaterThan(0.99);
       }
       expect(total, 'the oracle carries plugin bindings to compare').toBeGreaterThan(100);
     });
@@ -352,7 +357,7 @@ describe.runIf(META)('Magento DI vs compiled metadata', () => {
         expect(
           agreed / bindings,
           `${area}: inherited plugin coverage ${agreed}/${bindings}`,
-        ).toBeGreaterThan(0.95);
+        ).toBeGreaterThan(0.99);
       }
       expect(total, 'the oracle carries inherited chains to compare').toBeGreaterThan(100);
     });
