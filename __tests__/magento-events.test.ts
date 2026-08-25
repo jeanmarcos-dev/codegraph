@@ -102,4 +102,19 @@ describe('extractEvents', () => {
     );
     expect(references).toHaveLength(0);
   });
+
+  // `Event\Config\Converter` lowercases the declared name and
+  // `Event\Manager::dispatch` lowercases the dispatched one, so a declaration
+  // that shouts still observes the lower-case event.
+  it('lowercases the event name, as the config converter does', () => {
+    const { nodes } = extractEvents(
+      'app/code/Acme/M/etc/events.xml',
+      `<config>
+    <event name="Sales_Order_Place_After">
+        <observer name="acme" instance="Acme\\M\\Observer\\Placed"/>
+    </event>
+</config>`,
+    );
+    expect(nodes[0]!.name).toBe('sales_order_place_after');
+  });
 });

@@ -74,7 +74,11 @@ export function extractEvents(filePath: string, content: string): XmlExtraction 
   const references: UnresolvedRef[] = [];
 
   for (const event of findAll(root, 'event')) {
-    const name = attr(event, 'name');
+    // `Event\Config\Converter` lowercases the declared name and
+    // `Event\Manager::dispatch` lowercases the dispatched one, so the two only
+    // meet in lower case — an `<event name="Sales_Order_Place_After">` really
+    // does observe `sales_order_place_after`.
+    const name = attr(event, 'name')?.toLowerCase();
     if (!name) continue;
 
     const observers = findAll(event, 'observer').filter(

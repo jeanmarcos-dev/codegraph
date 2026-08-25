@@ -524,7 +524,7 @@ export async function magentoFactoryEdges(
  * `vendor/magento` stay unlinked on this side by design; their event node still
  * answers which observers run.
  */
-const EVENT_DISPATCH_RE = /->\s*dispatch\s*\(\s*['"]([a-z][a-z0-9_]*)['"]/g;
+const EVENT_DISPATCH_RE = /->\s*dispatch\s*\(\s*['"]([A-Za-z][A-Za-z0-9_]*)['"]/g;
 
 export async function magentoEventDispatchEdges(
   context: ResolutionContext,
@@ -555,7 +555,7 @@ export async function magentoEventDispatchEdges(
     EVENT_DISPATCH_RE.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = EVENT_DISPATCH_RE.exec(source)) !== null) {
-      const targets = eventNodes.get(match[1]!);
+      const targets = eventNodes.get(match[1]!.toLowerCase());
       if (!targets) continue;
       const line = lineOf(source, match.index);
       const dispatcher = enclosingMethod(nodesInFile, line);
