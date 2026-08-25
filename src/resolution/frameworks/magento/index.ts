@@ -20,7 +20,7 @@ import type {
   ResolvedRef,
   UnresolvedRef,
 } from '../../types';
-import { parseXml, findAll, attr } from './xml';
+import { parseXml, findAll, findChildren, attr } from './xml';
 import {
   extractEvents,
   extractWebapiRoutes,
@@ -52,6 +52,7 @@ const COMPOSER_TYPES = ['magento2-module', 'magento2-theme', 'magento2-language'
 /** Config files live at `etc/<file>.xml` or, per area, `etc/<area>/<file>.xml`. */
 const CONFIG_XML_RE = {
   module: /(^|\/)etc\/module\.xml$/,
+  di: /(^|\/)etc\/(?:\w+\/)?di\.xml$/,
   events: /(^|\/)etc\/(?:\w+\/)?events\.xml$/,
   webapi: /(^|\/)etc\/(?:\w+\/)?webapi\.xml$/,
   routes: /(^|\/)etc\/(?:\w+\/)?routes\.xml$/,
@@ -90,6 +91,58 @@ function detectFromModuleLayout(context: ResolutionContext): boolean {
     if (context.fileExists(registration)) return true;
   }
   return false;
+}
+
+/**
+ * `<virtualType>` — a configured alias for a real class.
+ *
+ * A virtual type is named all over `di.xml` and injected like a class, but it
+ * exists nowhere on disk, so searching for one found nothing and the argument
+ * that injects it pointed at a name the graph did not contain. Each gets a
+ * `type_alias` node referencing the type it configures — the same shape a
+ * language-level alias gets.
+ */
+function virtualTypeNodes(
+  filePath: string,
+  content: string,
+): { nodes: Node[]; references: UnresolvedRef[] } {
+  const root = parseXml(content);
+  if (!root) return { nodes: [], references: [] };
+
+  const nodes: Node[] = [];
+  const references: UnresolvedRef[] = [];
+  for (const virtualType of findChildren(root, 'virtualType')) {
+    const name = attr(virtualType, 'name');
+    if (!name) continue;
+    const node: Node = {
+      id: `magento-virtualtype:${filePath}:${virtualType.line}:${name}`,
+      kind: 'type_alias',
+      name,
+      qualifiedName: name,
+      filePath,
+      startLine: virtualType.line,
+      endLine: virtualType.line,
+      startColumn: 0,
+      endColumn: 0,
+      language: 'xml',
+      updatedAt: Date.now(),
+    };
+    nodes.push(node);
+
+    const base = attr(virtualType, 'type');
+    if (base) {
+      references.push({
+        fromNodeId: node.id,
+        referenceName: base,
+        referenceKind: 'references',
+        line: virtualType.line,
+        column: 0,
+        filePath,
+        language: 'xml',
+      });
+    }
+  }
+  return { nodes, references };
 }
 
 function moduleNodes(filePath: string, content: string): { nodes: Node[]; references: UnresolvedRef[] } {
@@ -225,6 +278,7 @@ export const magentoResolver: FrameworkResolver = {
     if (CONFIG_XML_RE.routes.test(filePath)) return extractFrontendRoutes(filePath, content);
     if (CONFIG_XML_RE.crontab.test(filePath)) return extractCronJobs(filePath, content);
     if (CONFIG_XML_RE.queueConsumer.test(filePath)) return extractQueueConsumers(filePath, content);
+    if (CONFIG_XML_RE.di.test(filePath)) return virtualTypeNodes(filePath, content);
 
     const layout = extractLayout(filePath, content);
     if (layout.nodes.length > 0) return layout;

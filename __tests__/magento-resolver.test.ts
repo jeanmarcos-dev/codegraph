@@ -251,3 +251,53 @@ describe('resolve', () => {
     expect(result!.targetNodeId).toBe(moduleNode.id);
   });
 });
+
+/**
+ * A virtual type is named all over `di.xml` and injected like a class, but it
+ * exists nowhere on disk — so searching for one found nothing, and the argument
+ * that injects it pointed at a name the graph did not contain.
+ */
+describe('extract: etc/di.xml virtual types', () => {
+  it('emits a type_alias node referencing the type it configures', () => {
+    const { nodes, references } = magentoResolver.extract!(
+      'app/code/Acme/M/etc/di.xml',
+      `<config>
+    <virtualType name="acmeCollectionFactory" type="Acme\\M\\Model\\Base"/>
+</config>`,
+      'xml',
+    );
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]!.kind).toBe('type_alias');
+    expect(nodes[0]!.name).toBe('acmeCollectionFactory');
+    expect(nodes[0]!.startLine).toBe(2);
+    expect(references.map((r) => r.referenceName)).toEqual(['Acme\\M\\Model\\Base']);
+  });
+
+  it('emits nothing for a di.xml with no virtual types', () => {
+    const { nodes } = magentoResolver.extract!(
+      'app/code/Acme/M/etc/di.xml',
+      '<config><preference for="A" type="B"/></config>',
+      'xml',
+    );
+    expect(nodes).toHaveLength(0);
+  });
+
+  // Only direct children of `<config>` are declarations: a `<virtualType>` deep
+  // inside an `<argument>` tree is data, not a declaration.
+  it('ignores a virtualType nested inside an argument', () => {
+    const { nodes } = magentoResolver.extract!(
+      'app/code/Acme/M/etc/di.xml',
+      `<config>
+    <type name="Acme\\Target">
+        <arguments>
+            <argument name="x" xsi:type="array">
+                <virtualType name="notADeclaration" type="Acme\\Base"/>
+            </argument>
+        </arguments>
+    </type>
+</config>`,
+      'xml',
+    );
+    expect(nodes).toHaveLength(0);
+  });
+});
