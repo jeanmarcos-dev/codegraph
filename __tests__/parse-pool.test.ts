@@ -11,13 +11,13 @@
  * parallelism safe.
  */
 import { describe, it, expect } from 'vitest';
-import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
+import { ParseWorkerPool, parseWindowSize, resolveParseBudgetMs, resolveParsePoolSize, resolveParseTimeoutMs, workersWorthStarting, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
 import type { Language, ExtractionResult } from '../src/types';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface ParseMsg { type: 'parse'; id: number; filePath: string; content: string; language: Language }
-type Action = { result: ExtractionResult } | { crash: true } | { hang: true } | { wait: Promise<ExtractionResult> };
+type Action = { result: ExtractionResult; parseMs?: number } | { crash: true } | { hang: true } | { wait: Promise<ExtractionResult> };
 
 /**
  * Fake worker speaking the same {load-grammars → grammars-loaded} /
@@ -37,8 +37,8 @@ class FakeWorker implements ParsePoolWorker {
     else if (event === 'exit') this.exitCb = cb;
     // 'error' unused by the fakes
   }
-  private reply(id: number, result: ExtractionResult): void {
-    if (this.alive) this.msgCb?.({ type: 'parse-result', id, result });
+  private reply(id: number, result: ExtractionResult, parseMs?: number): void {
+    if (this.alive) this.msgCb?.({ type: 'parse-result', id, result, parseMs });
   }
   postMessage(msg: unknown): void {
     const m = msg as { type: string } & Partial<ParseMsg>;
@@ -55,7 +55,7 @@ class FakeWorker implements ParsePoolWorker {
     }
     if ('hang' in action) return; // never reply → timeout path
     if ('wait' in action) { void action.wait.then((r) => this.reply(m.id!, r)); return; }
-    setTimeout(() => this.reply(m.id!, action.result), 0);
+    setTimeout(() => this.reply(m.id!, action.result, action.parseMs), 0);
   }
   terminate(): Promise<number> { this.alive = false; this.onTerminate?.(); return Promise.resolve(0); }
 }
@@ -67,7 +67,7 @@ const result = (tag = 0): ExtractionResult => ({ nodes: [], edges: [], unresolve
 function makePool(
   size: number,
   behavior: (m: ParseMsg) => Action,
-  opts: Partial<{ recycleInterval: number; parseTimeoutMs: number }> = {}
+  opts: Partial<{ recycleInterval: number; parseTimeoutMs: number; expectedParses: number }> = {}
 ) {
   let spawned = 0, terminated = 0;
   const pool = new ParseWorkerPool({
@@ -75,6 +75,7 @@ function makePool(
     size,
     recycleInterval: opts.recycleInterval,
     parseTimeoutMs: opts.parseTimeoutMs,
+    expectedParses: opts.expectedParses,
     createWorker: () => { spawned++; return new FakeWorker(behavior, () => { terminated++; }); },
   });
   return { pool, counts: () => ({ spawned, terminated }) };
@@ -94,6 +95,17 @@ describe('resolveParseTimeoutMs', () => {
   });
 });
 
+describe('resolveParseBudgetMs', () => {
+  it('caps near-limit blob headers at a 20s soft / 60s hard window (#1555)', () => {
+    expect(resolveParseBudgetMs(10_000, 940_800)).toBe(20_000);
+    expect(resolveParseBudgetMs(10_000, 857_376)).toBe(20_000);
+  });
+
+  it('does not clamp an explicit larger base timeout', () => {
+    expect(resolveParseBudgetMs(45_000, 940_800)).toBe(45_000);
+  });
+});
+
 describe('resolveParsePoolSize', () => {
   it('treats explicit 0 and 1 as a single worker (the rollback path)', () => {
     expect(resolveParsePoolSize('0', 8)).toBe(1);
@@ -110,6 +122,28 @@ describe('resolveParsePoolSize', () => {
     expect(resolveParsePoolSize(undefined, 1)).toBe(1);   // never zero
     expect(resolveParsePoolSize(undefined, 2)).toBe(1);   // leave a core
     expect(resolveParsePoolSize(undefined, 64)).toBe(8);  // never above the default cap
+  });
+});
+
+describe('parseWindowSize', () => {
+  it('lets every worker run well ahead of a slow file at the commit cursor', () => {
+    expect(parseWindowSize(1)).toBe(8);
+    expect(parseWindowSize(8)).toBe(64);
+  });
+});
+
+describe('workersWorthStarting', () => {
+  it('takes one more worker while it saves enough of the wall clock', () => {
+    expect(workersWorthStarting(40, 8)).toBe(1);
+    expect(workersWorthStarting(350, 8)).toBe(3);
+    expect(workersWorthStarting(600, 8)).toBe(4);
+    expect(workersWorthStarting(1400, 8)).toBe(6);
+  });
+
+  it('stays within the pool, and keeps a worker when nothing is known to be left', () => {
+    expect(workersWorthStarting(60_000, 8)).toBe(8);
+    expect(workersWorthStarting(60_000, 3)).toBe(3);
+    expect(workersWorthStarting(0, 8)).toBe(1);
   });
 });
 
@@ -140,6 +174,47 @@ describe('ParseWorkerPool', () => {
     const { pool, counts } = makePool(8, () => ({ result: result() }));
     await pool.requestParse(task('only.ts'));
     expect(counts().spawned).toBe(1); // just the eager warm worker
+    await pool.destroy();
+  });
+
+  it('prewarms what the run is worth, not the whole pool', async () => {
+    const small = makePool(8, () => ({ result: result() }), { expectedParses: 100 }).pool;
+    small.prewarm();
+    expect(small.liveWorkers).toBe(3);
+    await small.destroy();
+
+    const tiny = makePool(8, () => ({ result: result() }), { expectedParses: 5 }).pool;
+    tiny.prewarm();
+    expect(tiny.liveWorkers).toBe(1);
+    await tiny.destroy();
+
+    const big = makePool(8, () => ({ result: result() }), { expectedParses: 5000 }).pool;
+    big.prewarm();
+    expect(big.liveWorkers).toBe(8);
+    await big.destroy();
+  });
+
+  it('prewarms the whole pool when the run gave no count', async () => {
+    const { pool } = makePool(8, () => ({ result: result() }));
+    pool.prewarm();
+    expect(pool.liveWorkers).toBe(8);
+    await pool.destroy();
+  });
+
+  it('stays small while parses are as cheap as expected', async () => {
+    const { pool } = makePool(8, () => ({ result: result(), parseMs: 2 }), { expectedParses: 100 });
+    pool.prewarm();
+    await Promise.all(Array.from({ length: 100 }, (_, i) => pool.requestParse(task(`f${i}.ts`))));
+    expect(pool.liveWorkers).toBe(3);
+    await pool.destroy();
+  });
+
+  it('grows when the run measures its parses as dearer than a typical file', async () => {
+    const { pool } = makePool(8, () => ({ result: result(), parseMs: 200 }), { expectedParses: 100 });
+    pool.prewarm();
+    expect(pool.liveWorkers).toBe(3);
+    await Promise.all(Array.from({ length: 100 }, (_, i) => pool.requestParse(task(`f${i}.ts`))));
+    expect(pool.liveWorkers).toBe(8);
     await pool.destroy();
   });
 
@@ -235,5 +310,84 @@ describe('ParseWorkerPool', () => {
     await pool.destroy();
     await expect(p).rejects.toThrow(/destroyed/);
     await expect(pool.requestParse(task('y.ts'))).rejects.toThrow(/destroyed/);
+  });
+});
+
+/**
+ * A fake whose grammar load takes `loadMs` (or never finishes, with `null`), and
+ * which records when it finished loading and when it was terminated.
+ */
+class SlowLoadWorker implements ParsePoolWorker {
+  private msgCb?: (m: unknown) => void;
+  private exitCb?: (code: number) => void;
+  loadedAt: number | null = null;
+  terminatedAt: number | null = null;
+  constructor(private loadMs: number | null) {}
+  on(event: string, cb: (...args: any[]) => void): void {
+    if (event === 'message') this.msgCb = cb;
+    else if (event === 'exit') this.exitCb = cb;
+  }
+  postMessage(msg: unknown): void {
+    if ((msg as { type: string }).type !== 'load-grammars' || this.loadMs === null) return;
+    setTimeout(() => {
+      if (this.terminatedAt !== null) return;
+      this.loadedAt = performance.now();
+      this.msgCb?.({ type: 'grammars-loaded' });
+    }, this.loadMs);
+  }
+  exit(code: number): void { this.exitCb?.(code); }
+  terminate(): Promise<number> { this.terminatedAt = performance.now(); return Promise.resolve(0); }
+}
+
+describe('teardown never terminates a worker mid-load', () => {
+  // Terminating a worker whose grammar WASM is still compiling can crash the
+  // process with an access violation (0xC0000005) on Windows; a pool torn down
+  // right after a short index often has a late-spawned worker in that state.
+  const poolOf = (worker: SlowLoadWorker, loadSettleMs?: number) =>
+    new ParseWorkerPool({ languages: ['typescript'] as Language[], size: 1, createWorker: () => worker, loadSettleMs });
+
+  it('waits for a loading worker to finish before terminating it', async () => {
+    const w = new SlowLoadWorker(120);
+    const pool = poolOf(w);
+    await pool.destroy();
+    expect(w.loadedAt).not.toBeNull();
+    expect(w.terminatedAt).not.toBeNull();
+    expect(w.terminatedAt!).toBeGreaterThanOrEqual(w.loadedAt!);
+  });
+
+  it('terminates a worker that is already loaded right away', async () => {
+    const w = new SlowLoadWorker(0);
+    const pool = poolOf(w);
+    await sleep(20);
+    expect(w.loadedAt).not.toBeNull();
+    const t0 = performance.now();
+    await pool.destroy();
+    expect(w.terminatedAt! - t0).toBeLessThan(50);
+  });
+
+  it('does not wait past the cap on a load that never finishes', async () => {
+    const w = new SlowLoadWorker(null);
+    const pool = poolOf(w, 80);
+    const t0 = performance.now();
+    await pool.destroy();
+    expect(w.terminatedAt).not.toBeNull();
+    expect(w.terminatedAt! - t0).toBeGreaterThanOrEqual(70);
+    expect(w.terminatedAt! - t0).toBeLessThan(1000);
+  });
+
+  it('does not wait on a worker that died while loading', async () => {
+    const w = new SlowLoadWorker(null);
+    // The pool respawns a crashed worker; the replacement loads normally. The
+    // default 15s cap stays, so waiting on the dead one would time the test out.
+    const workers = [w];
+    const pool = new ParseWorkerPool({
+      languages: ['typescript'] as Language[], size: 1,
+      createWorker: () => workers.shift() ?? new SlowLoadWorker(0),
+    });
+    w.exit(1);
+    await sleep(20);
+    const t0 = performance.now();
+    await pool.destroy();
+    expect(performance.now() - t0).toBeLessThan(200);
   });
 });

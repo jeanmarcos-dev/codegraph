@@ -48,6 +48,13 @@ export const NODE_KINDS = [
 export type NodeKind = (typeof NODE_KINDS)[number];
 
 /**
+ * The docstring both engines give a Java record's implicit component accessor
+ * (languages/java.ts, codegraph-kernel/src/java.rs). The resolver reaches one
+ * only through what types its receiver, never by a name-only guess.
+ */
+export const IMPLICIT_RECORD_ACCESSOR_DOC = 'Implicit record component accessor';
+
+/**
  * Types of edges (relationships) between nodes.
  *
  * Runtime-iterable like NODE_KINDS. The ARRAY ORDER is part of the native
@@ -67,6 +74,7 @@ export const EDGE_KINDS = [
   'instantiates',    // Creates instance of class
   'overrides',       // Method overrides parent method
   'decorates',       // Decorator applied to symbol
+  'navigates',       // Navigates to a screen/route (Expo Router `router.push('/x')`)
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];
@@ -264,6 +272,39 @@ export interface FileRecord {
   generated?: boolean;
 }
 
+/**
+ * Files found against files that yielded symbols, by language, for `status`.
+ * `GraphStats.filesByLanguage` counts files by what they are, so on its own it
+ * reads the same for a language that parsed and one that yielded nothing.
+ */
+export interface LanguageCoverage {
+  /**
+   * Files that yielded a symbol, for the languages expected to. A language
+   * tracked at file level (yaml, most xml) has no entry: nothing is missing.
+   */
+  parsedFilesByLanguage: Partial<Record<Language, number>>;
+  /** Languages expected to yield symbols that have files, none of which did. */
+  unparsedLanguages: Language[];
+}
+
+/**
+ * Indexed files whose symbols are missing even though their content hash is
+ * current — what a hash comparison alone calls "up to date" (#2336). Paths are
+ * project-relative and sorted.
+ */
+export interface IndexHealth {
+  /**
+   * Files `sync` re-indexes: stored while their grammar could not load (#2335)
+   * or stored with no nodes and no recorded reason (#1541).
+   */
+  needsReindex: string[];
+  /**
+   * Files with a recorded parse error and no symbols from it. Deterministic:
+   * they stay this way until the file (or the parser) changes.
+   */
+  parseErrors: string[];
+}
+
 // =============================================================================
 // Extraction Types
 // =============================================================================
@@ -399,6 +440,17 @@ export interface Subgraph {
    * for graph traversals that don't run the search-ranking path.
    */
   confidence?: 'high' | 'low';
+
+  /** True when a traversal stopped at its node/edge safety budget. */
+  truncated?: boolean;
+}
+
+/** Safety budgets for impact traversal on high-fanout graphs. */
+export interface ImpactOptions {
+  /** Maximum nodes retained, including the focal node. Default: 10,000. */
+  maxNodes?: number;
+  /** Maximum edges retained. Default: 50,000. */
+  maxEdges?: number;
 }
 
 /**
@@ -688,4 +740,13 @@ export interface FindRelevantContextOptions {
 
   /** Node types to include */
   nodeKinds?: NodeKind[];
+
+  /**
+   * Extra symbol names to merge in as exact-name search candidates, at a
+   * dampened score. Fed by the segment-vocabulary supplement (CodeGraph.
+   * findRelevantContext): word-level query terms can't reach camelCase names
+   * through FTS — `pinFeedIfNearBottom` is one FTS token — so names whose
+   * SEGMENTS the query's words name are seeded here instead.
+   */
+  seedNames?: string[];
 }

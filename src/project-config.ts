@@ -67,6 +67,21 @@ export interface ProjectConfig {
    * wins. Absent/empty (the default) forces nothing in.
    */
   include?: string[];
+  /**
+   * Gitignore-style patterns for paths that should still be INDEXED and
+   * findable, but must not outrank first-party code in search ranking (#982).
+   *
+   * The ranking counterpart to `exclude`: `exclude` is a recall lever (the
+   * content leaves the index entirely), this is a relevance lever (the content
+   * stays, it just stops winning). It generalizes the built-in
+   * example/sample/fixture/benchmark de-prioritization to trees only the
+   * project knows about — an `optional-skills/` or `scripts/` directory whose
+   * helpers share generic symbol names with real code. Matched against
+   * project-root-relative paths, so `"optional-skills/"`, a recursive glob, or
+   * `"tools/gen"` all work. Absent/empty (the default) de-prioritizes nothing
+   * beyond the built-ins.
+   */
+  deprioritize?: string[];
   /** Magento-specific resolution switches. */
   magento?: {
     /**
@@ -86,6 +101,7 @@ interface ParsedConfig {
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
+  deprioritize: string[];
   include: string[];
   magentoInheritPlugins: boolean;
 }
@@ -110,6 +126,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
+  deprioritize: Object.freeze([]) as unknown as string[],
   magentoInheritPlugins: true,
 });
 
@@ -163,17 +180,19 @@ function parseConfig(file: string): ParsedConfig {
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
+  const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   const magentoInheritPlugins = extractBoolean(parsed, 'magento', 'inheritPlugins', true, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
+    deprioritize.length === 0 &&
     magentoInheritPlugins
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, magentoInheritPlugins };
+  return { extensions, includeIgnored, exclude, include, deprioritize, magentoInheritPlugins };
 }
 
 /** Read `section.key` as a boolean, warning and falling back on anything else. */
@@ -239,6 +258,29 @@ function extractIncludeIgnored(parsed: object, file: string): string[] {
   for (const entry of raw) {
     if (typeof entry !== 'string' || !entry.trim()) {
       logWarn(`Ignoring an "includeIgnored" entry in ${PROJECT_CONFIG_FILENAME}: every pattern must be a non-empty string`, { file });
+      continue;
+    }
+    out.push(entry.trim());
+  }
+  return out;
+}
+
+/**
+ * Validate a gitignore-style pattern list under `key`. A non-array value or a
+ * non-string/blank entry warns-and-skips; never throws. Patterns are kept
+ * verbatim (trimmed) so they match exactly as a `.gitignore` line would.
+ */
+function extractPatternList(parsed: object, file: string, key: 'deprioritize'): string[] {
+  const raw = (parsed as ProjectConfig)[key];
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "${key}" in ${PROJECT_CONFIG_FILENAME}: must be an array of gitignore-style patterns`, { file });
+    return [];
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logWarn(`Ignoring a "${key}" entry in ${PROJECT_CONFIG_FILENAME}: every pattern must be a non-empty string`, { file });
       continue;
     }
     out.push(entry.trim());
@@ -359,6 +401,17 @@ export function loadIncludeIgnoredPatterns(rootDir: string): string[] {
  */
 export function loadExcludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).exclude;
+}
+
+/**
+ * Load the validated `deprioritize` patterns for a project, mtime-cached.
+ *
+ * These name indexed paths that must not outrank first-party code (#982) — the
+ * ranking counterpart to `exclude`. An empty result — the zero-config default —
+ * de-prioritizes nothing beyond the built-in example/fixture/benchmark dirs.
+ */
+export function loadDeprioritizePatterns(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).deprioritize;
 }
 
 /**

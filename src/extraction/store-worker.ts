@@ -22,16 +22,14 @@
  */
 
 // Compile cache FIRST — same worker-boot rationale as parse-worker.ts.
-try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
-} catch { /* cache is best-effort */ }
+import '../compile-cache';
 
 import { parentPort } from 'worker_threads';
 import { QueryBuilder } from '../db/queries';
 import { createDatabase, SqliteDatabase } from '../db/sqlite-adapter';
 import { finalizeStoreBundle, type KernelStoreBundle, type StoreBundle } from './store-writer';
 import { decodeExtractBuffers } from './kernel/decode';
+import { collectBeforeExit } from '../worker-teardown';
 
 if (!parentPort) {
   throw new Error('store-worker must be run as a worker thread');
@@ -70,6 +68,7 @@ function decodeKernelBundle(bundle: KernelStoreBundle): StoreBundle {
     bundle.filePath,
     bundle.language
   );
+  if (bundle.extraRefs?.length) decoded.unresolvedReferences.push(...bundle.extraRefs);
   return finalizeStoreBundle(decoded, bundle.filePath, bundle.language, bundle.file);
 }
 
@@ -134,6 +133,8 @@ port.on('message', (msg: InMessage) => {
         } catch {
           /* already closed */
         }
+        // No GC marking in flight when the thread ends (worker-teardown.ts).
+        collectBeforeExit();
         process.exit(0);
         break;
       }

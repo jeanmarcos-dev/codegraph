@@ -26,6 +26,9 @@ fun com.example.Qualified.qext() {}
 suspend fun suspender(): Unit { helper() }
 
 private internal fun visFn() {}
+private val hiddenTop = 1
+internal var sharedTop = 2
+
 
 fun inferred() = helper()
 
@@ -50,9 +53,18 @@ val topDelegated by lazy { WidgetK(1) }
 val (destA, destB) = makePair()
 val withGetter: Int
     get() = 42
+val initLambda: () -> Unit = { caller() }
+val initSam = Runnable { caller() }
+val handlerList = listOf(::caller)
+val initObject = object : Runnable {
+    override fun run() {
+        caller()
+    }
+}
 
 class WidgetK(val size: Int, private var name: String = defaultName()) {
     val area: Int = size * size
+    val hooks = listOf(::caller)
     var label: String? = null
     val computed: Int
         get() = size * 2
@@ -265,3 +277,75 @@ fun labeledLambda() {
 }
 
 fun whereClause(): Int where Int : Comparable<Int> = 1
+
+class AccessorK {
+    val sameLineGetter: Int get() = compute()
+    var sameLinePair: Int get() = compute()
+        set(v) { draw(v) }
+}
+
+class SiblingAccessorK {
+    var nextLine: Int = 0
+        get() = compute()
+        set(v) { draw(v) }
+    val (localA, localB) = makePair()
+    init {
+        val fromInit = compute()
+        register(fromInit)
+    }
+}
+
+class ReceiverChainK(private val engine: EngineK) {
+    fun chains() {
+        engine.pump.drain()
+        this.engine.drain()
+        engine?.pump?.drain()
+        engine
+            .pump
+            .drain()
+        engine.a.b.c.drain()
+        engine.a.b.c.d.drain()
+        engine!!.pump.drain()
+        (engine).pump.drain()
+        engine.pump().drain()
+        super.toString().length.toString()
+    }
+}
+
+// Object expressions as anonymous classes: dotted and generic supertypes, a
+// constructor and a `by` delegate in the header, nested and supertype-less ones.
+// (Multi-line bodies: a one-line class body sets the grammar's phantom error.)
+class ObjectExpressions {
+    val held = object : Outer.Listener, Runnable {
+        override fun on() {
+            helper()
+        }
+        override fun run() {
+        }
+    }
+    fun make(): Base = object : Base(compute()) {
+        override fun run() {
+            val inner = object : Runnable {
+                override fun run() {
+                    helper()
+                }
+            }
+        }
+    }
+    fun delegated() = object : api.IFoo by makeDelegate(), Marker {
+        val x = 1
+    }
+    fun generic() = object : pkg.Outer<IFoo.Stub>.Inner<List<String>>() {
+        val y = 2
+    }
+    fun bare() = object {
+        fun x() {
+            helper()
+        }
+    }
+    fun helper() {
+    }
+    fun compute(): Int = 1
+}
+
+class DottedSuper : Outer.Inner(), com.example.Api.Listener

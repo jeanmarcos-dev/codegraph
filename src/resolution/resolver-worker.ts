@@ -15,10 +15,7 @@
  */
 
 // Compile cache FIRST — same worker-boot rationale as parse-worker.ts.
-try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
-} catch { /* cache is best-effort */ }
+import '../compile-cache';
 
 import { parentPort, threadId } from 'worker_threads';
 import { createDatabase, SqliteDatabase } from '../db/sqlite-adapter';
@@ -26,6 +23,8 @@ import { QueryBuilder } from '../db/queries';
 import { ReferenceResolver } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
+import { collectBeforeExit } from '../worker-teardown';
+import type { ProjectScans } from './project-scans';
 import type { UnresolvedReference } from '../types';
 
 if (!parentPort) {
@@ -38,7 +37,8 @@ let queries: QueryBuilder | null = null;
 let resolver: ReferenceResolver | null = null;
 
 type InMessage =
-  | { type: 'open'; dbPath: string; projectRoot: string }
+  | { type: 'open'; dbPath: string; projectRoot: string; frameworks?: string[] }
+  | { type: 'scans'; scans: ProjectScans }
   | { type: 'recycle'; id: number }
   | { type: 'resolve'; id: number; refs: UnresolvedReference[] }
   | { type: 'synth'; id: number; pass: string }
@@ -59,9 +59,13 @@ port.on('message', (msg: InMessage) => {
         const tDb = Date.now();
         queries = new QueryBuilder(db);
         resolver = new ReferenceResolver(msg.projectRoot, queries);
-        resolver.initialize();
+        resolver.initialize(msg.frameworks);
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);
         port.postMessage({ type: 'ready' });
+        break;
+      }
+      case 'scans': {
+        resolver?.adoptProjectScans(msg.scans);
         break;
       }
       case 'recycle': {
@@ -126,6 +130,8 @@ port.on('message', (msg: InMessage) => {
         } catch {
           /* already closed */
         }
+        // No GC marking in flight when the thread ends (worker-teardown.ts).
+        collectBeforeExit();
         process.exit(0);
         break;
       }

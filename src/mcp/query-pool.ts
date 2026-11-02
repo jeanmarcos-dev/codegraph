@@ -17,6 +17,9 @@
  *     once; a poison call that keeps crashing fails gracefully (never wedges the
  *     pool). A crash budget trips a circuit breaker (`healthy` → false) so the
  *     caller falls back to in-process dispatch instead of thrashing respawns.
+ *   - idle trim: a pool that goes quiet gives its memory back. The workers a
+ *     burst added exit, and the last one to serve stays up and shrinks in
+ *     place, so the next call finds a warm worker rather than a cold start.
  *   - graceful backstop: a call that can't be served within `softTimeoutMs`
  *     resolves with SUCCESS-shaped "busy, retry" guidance — never `isError`, so
  *     a momentary overload can't teach the agent to abandon codegraph — instead
@@ -48,6 +51,22 @@ export interface PoolWorker {
 /** Default linger before a queued call is answered with busy-guidance. */
 const DEFAULT_BUSY_TIMEOUT_MS = 45_000; // < the ~60s MCP client request timeout
 
+/** Shrink a quiescent pool after a burst so worker-local graph/SQLite caches
+ * do not remain resident for the daemon's whole lifetime. Long enough that an
+ * agent pausing to edit or build keeps every worker it grew. */
+const DEFAULT_IDLE_SHRINK_MS = 300_000;
+
+/** How long a retired idle worker gets to exit on 'close' before it is terminated. */
+const RETIRE_TIMEOUT_MS = 5_000;
+
+/**
+ * Most a worker may still hold after its idle trim and stay. A trimmed worker
+ * holds about 80 MB, mostly heap and tree-sitter's wasm, whatever the size of
+ * the project; one above this holds something that won't come back in place,
+ * so it costs less to replace it than to keep it for the rest of the session.
+ */
+const DEFAULT_IDLE_KEEP_BYTES = 256 * 1024 * 1024;
+
 /** Hard ceiling on pool size regardless of core count / env. */
 const MAX_POOL_SIZE = 16;
 
@@ -69,12 +88,25 @@ const CRASH_BUDGET = 12;
  */
 const MAX_CONCURRENT_SPAWN = 2;
 
+/**
+ * How long `destroy()` waits for a worker that is still starting up before
+ * terminating it anyway. Terminating a worker while it is still loading its
+ * modules can take the whole process down with an access violation
+ * (0xC0000005, seen on Windows), and the daemon shuts its pool down whenever
+ * it stops — a session that ends within a few seconds of starting has a
+ * worker in exactly that state. A start takes about a second normally and a
+ * few under heavy load; the cap only bounds a start that is wedged.
+ */
+const WORKER_START_SETTLE_MS = 15_000;
+
 /** Shape of a message a worker posts back (ready handshake or a tool result). */
 interface WorkerMessage {
   type?: string;
   ok?: boolean;
   id?: number;
   result?: ToolResult;
+  /** On 'trimmed': the heap and buffers the worker still holds. */
+  heldBytes?: number;
 }
 
 interface Job {
@@ -89,16 +121,24 @@ interface Job {
 }
 
 export interface QueryPoolOptions {
-  /** Default project root each worker opens at spawn. */
-  root: string;
+  /** Default project root each worker opens at spawn, or null for per-call projects. */
+  root: string | null;
   /** Max worker threads. Defaults to `clamp(cores-1, 1, 16)`. */
   size?: number;
   /** Linger before a queued call gets busy-guidance. Default 45s. */
   softTimeoutMs?: number;
   /** Retries for an in-flight call whose worker crashed. Default 1. */
   maxRetries?: number;
+  /** Idle delay before shrinking to one trimmed worker. Default 5 minutes; 0 disables. */
+  idleShrinkMs?: number;
+  /** A worker holding more than this after its trim is replaced. Default 256 MB; 0 replaces any. */
+  idleKeepBytes?: number;
+  /** How long a retired idle worker gets to exit by itself (tests shorten it). Default 5s. */
+  retireTimeoutMs?: number;
   /** Worker factory (tests inject a fake). Defaults to a real `worker_threads` Worker. */
   createWorker?: () => PoolWorker;
+  /** How long destroy() waits on a worker still starting up (tests shorten it). Default 15s. */
+  startSettleMs?: number;
 }
 
 /**
@@ -150,21 +190,43 @@ export class QueryPool {
   // a large DB open) saturate the box and starve the main loop. Grow only when
   // the queue outstrips idle + pending.
   private pendingWorkers = new Set<PoolWorker>();
+  // Each worker's start, settled when it posts 'ready' (either way) or goes
+  // away — what destroy() waits on before terminating it (see
+  // WORKER_START_SETTLE_MS).
+  private starts = new Map<PoolWorker, { settled: Promise<void>; settle: () => void }>();
   private nextId = 1;
   private totalCrashes = 0;
   private destroyed = false;
-  private readonly root: string;
+  private readonly root: string | null;
   private readonly maxSize: number;
   private readonly softTimeoutMs: number;
   private readonly maxRetries: number;
+  private readonly idleShrinkMs: number;
+  private readonly idleKeepBytes: number;
+  private readonly retireTimeoutMs: number;
   private readonly createWorker: () => PoolWorker;
+  private readonly startSettleMs: number;
+  private idleShrinkTimer?: NodeJS.Timeout;
+  // Retired idle workers asked to exit: the timer that terminates one that
+  // hasn't by retireTimeoutMs, and what destroy() waits on.
+  private retiring = new Map<PoolWorker, { cap: NodeJS.Timeout; gone: Promise<void>; settle: () => void }>();
+  // Set by a served call and cleared by a shrink, so a worker that has answered
+  // nothing since is left alone rather than trimmed again for its own sake.
+  private servedSinceShrink = false;
+  // The worker that answered last, which is the one worth keeping: its caches
+  // and its compiled code are what the next call would otherwise rebuild.
+  private lastServer?: PoolWorker;
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
     this.maxSize = Math.max(1, Math.min(opts.size ?? Math.max(1, os.cpus().length - 1), MAX_POOL_SIZE));
     this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
     this.maxRetries = opts.maxRetries ?? 1;
+    this.idleShrinkMs = Math.max(0, opts.idleShrinkMs ?? DEFAULT_IDLE_SHRINK_MS);
+    this.idleKeepBytes = opts.idleKeepBytes ?? DEFAULT_IDLE_KEEP_BYTES;
+    this.retireTimeoutMs = opts.retireTimeoutMs ?? RETIRE_TIMEOUT_MS;
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
+    this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
     this.spawnOne(); // one eager warm worker, ready for the first call
   }
 
@@ -192,8 +254,10 @@ export class QueryPool {
    * hitting that window was the recurring #662 test flake (and a real
    * first-call stall for agents). The pool exists for CONCURRENT load, which
    * by definition arrives after warm-up; the pre-pool in-process path is
-   * strictly better while nothing is warm. Stays true for the pool's
-   * lifetime — later crash-respawn gaps are covered by retry + backstop.
+   * strictly better while nothing is warm, which also holds while the
+   * replacement for a worker too heavy to keep starts. Stays true across an
+   * idle shrink, whose kept worker never stops serving, and across crash-respawn
+   * gaps, which are covered by retry + backstop.
    */
   get ready(): boolean {
     return this.everReady && !this.destroyed;
@@ -211,28 +275,132 @@ export class QueryPool {
     }
     this.workers.add(w);
     this.pendingWorkers.add(w);
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    this.starts.set(w, { settled, settle });
     w.on('message', (m) => this.onMessage(w, (m ?? {}) as WorkerMessage));
-    w.on('error', () => this.onWorkerGone(w));
-    w.on('exit', (code) => { if (code !== 0) this.onWorkerGone(w); });
+    w.on('error', () => { this.startSettled(w); this.onWorkerGone(w); });
+    w.on('exit', (code) => { this.startSettled(w); this.retired(w); if (code !== 0) this.onWorkerGone(w); });
   }
 
   private onMessage(w: PoolWorker, m: WorkerMessage): void {
-    if (!m) return;
+    // Before the retired-worker check: destroy() waits on this for a worker
+    // it has already let go of.
+    if (m?.type === 'ready') this.startSettled(w);
+    if (!m || !this.workers.has(w)) return; // ignore late messages from retired workers
     if (m.type === 'ready') {
-      this.pendingWorkers.delete(w);
-      if (m.ok === false) this.totalCrashes++; // hard open failure
-      else this.everReady = true;
+      if (!this.pendingWorkers.delete(w)) return; // already handled this handshake
+      if (m.ok === false) {
+        this.onWorkerGone(w); // failed opens consume the same budget as crashes
+        return;
+      }
+      this.everReady = true;
       this.idle.push(w);
       this.drain();
+      this.armIdleShrink(); // the last result may have come while this one started
       return;
     }
     if (m.type === 'result') {
       const job = this.inflight.get(w);
       this.inflight.delete(w);
       this.idle.push(w);
+      this.servedSinceShrink = true;
+      this.lastServer = w;
       if (job) this.settle(job, m.result ?? busyGuidance(0));
       this.drain();
+      this.armIdleShrink();
+      return;
     }
+    if (m.type === 'trimmed') this.replaceIfHeavy(w, m.heldBytes ?? 0);
+  }
+
+  /** Nothing queued or running, nothing starting, and every worker free. */
+  private get quiescent(): boolean {
+    return !this.destroyed && this.queue.length === 0 && this.inflight.size === 0 &&
+      this.pendingWorkers.size === 0 && this.idle.length === this.workers.size;
+  }
+
+  private clearIdleShrink(): void {
+    if (this.idleShrinkTimer) clearTimeout(this.idleShrinkTimer);
+    this.idleShrinkTimer = undefined;
+  }
+
+  private armIdleShrink(): void {
+    this.clearIdleShrink();
+    if (this.idleShrinkMs === 0 || !this.servedSinceShrink || !this.quiescent) return;
+    this.idleShrinkTimer = setTimeout(() => this.shrinkIdle(), this.idleShrinkMs);
+    this.idleShrinkTimer.unref?.();
+  }
+
+  private shrinkIdle(): void {
+    this.idleShrinkTimer = undefined;
+    if (!this.quiescent) return;
+
+    // Keep one worker, trimmed in place, rather than ending them all and
+    // starting a clean one. A clean worker has to work out again everything a
+    // connection remembers (the dominant file, the name indexes): half a second
+    // on the next call on a mid-sized index, seconds on a large one. The trim
+    // leaves this one about 70 MB above a clean worker, on any index. Staying
+    // up also means no moment here when a call finds no worker.
+    const keep = this.lastServer && this.idle.includes(this.lastServer)
+      ? this.lastServer
+      : this.idle[this.idle.length - 1];
+    if (!keep) return;
+    for (const w of this.idle) {
+      if (w === keep) continue;
+      this.workers.delete(w);
+      this.retire(w);
+    }
+    this.idle = [keep];
+    this.servedSinceShrink = false;
+    try {
+      keep.postMessage({ type: 'trim' });
+    } catch { /* already gone: its 'exit' recovers the pool */ }
+  }
+
+  /**
+   * The last check on a kept worker: one that still holds a lot after its trim
+   * is ended like the rest, with one clean worker in its place, so that keeping
+   * a worker can't keep hold of what a large query left behind. Calls that come
+   * while the clean one starts are served in process. Back at work by now, it
+   * is left alone, and judged at the next shrink.
+   */
+  private replaceIfHeavy(w: PoolWorker, heldBytes: number): void {
+    if (heldBytes <= this.idleKeepBytes || !this.quiescent || this.workers.size !== 1) return;
+    this.workers.clear();
+    this.idle = [];
+    this.everReady = false;
+    this.retire(w);
+    this.spawnOne();
+  }
+
+  /**
+   * Ask an idle worker to exit by itself: it closes its connections and
+   * collects garbage first, so no marking is in flight when its thread ends
+   * (see worker-teardown.ts). One that hasn't exited by `retireTimeoutMs` is
+   * terminated.
+   */
+  private retire(w: PoolWorker): void {
+    const terminate = (): void => { void this.terminateStarted(w).then(() => this.retired(w)); };
+    const cap = setTimeout(terminate, this.retireTimeoutMs);
+    cap.unref?.();
+    let settle!: () => void;
+    const gone = new Promise<void>((resolve) => { settle = resolve; });
+    this.retiring.set(w, { cap, gone, settle });
+    try {
+      w.postMessage({ type: 'close' });
+    } catch {
+      clearTimeout(cap);
+      terminate();
+    }
+  }
+
+  private retired(w: PoolWorker): void {
+    const retirement = this.retiring.get(w);
+    if (!retirement) return;
+    clearTimeout(retirement.cap);
+    this.retiring.delete(w);
+    retirement.settle();
   }
 
   // A worker died (crash hook, OOM, segfault, exit≠0). Respawn a replacement and
@@ -291,6 +459,7 @@ export class QueryPool {
 
   /** Run a read tool on the pool. Always resolves (never rejects). */
   run(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    this.clearIdleShrink();
     return new Promise<ToolResult>((resolve) => {
       const job: Job = {
         id: this.nextId++, toolName, args, resolve,
@@ -308,10 +477,41 @@ export class QueryPool {
     });
   }
 
-  /** Terminate all workers and answer any outstanding calls gracefully. */
+  private startSettled(w: PoolWorker): void {
+    const start = this.starts.get(w);
+    if (!start) return;
+    this.starts.delete(w);
+    start.settle();
+  }
+
+  /**
+   * Terminate a worker, but not while it is still starting up: wait for it to
+   * post 'ready' (or go away), up to `startSettleMs` (WORKER_START_SETTLE_MS —
+   * see that constant for the crash this avoids).
+   */
+  private async terminateStarted(w: PoolWorker): Promise<void> {
+    const start = this.starts.get(w);
+    if (start) {
+      let cap: NodeJS.Timeout | undefined;
+      await Promise.race([
+        start.settled,
+        new Promise<void>((resolve) => { cap = setTimeout(resolve, this.startSettleMs); cap.unref?.(); }),
+      ]);
+      clearTimeout(cap);
+    }
+    try { await w.terminate(); } catch { /* already gone */ }
+  }
+
+  /**
+   * Terminate all workers and answer any outstanding calls gracefully. A worker
+   * still starting up is terminated once it has started (see
+   * WORKER_START_SETTLE_MS); outstanding calls are answered first. A retired
+   * worker still on its way out is waited for, not left to end with the process.
+   */
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.clearIdleShrink();
     const ws = [...this.workers];
     this.workers.clear();
     this.pendingWorkers.clear();
@@ -321,6 +521,9 @@ export class QueryPool {
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => Promise.resolve(w.terminate()).catch(() => { /* already gone */ })));
+    await Promise.all([
+      ...ws.map((w) => this.terminateStarted(w)),
+      ...[...this.retiring.values()].map((retirement) => retirement.gone),
+    ]);
   }
 }

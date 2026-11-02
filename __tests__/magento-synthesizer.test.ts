@@ -17,6 +17,7 @@ import {
   magentoControllerRouteEdges,
 } from '../src/resolution/magento-synthesizer';
 import { clearMagentoConfigCache } from '../src/resolution/frameworks/magento/config';
+import { hasSynthesisPattern } from '../src/resolution/callback-synthesizer';
 import type { ResolutionContext } from '../src/resolution/types';
 import type { Edge, Node } from '../src/types';
 
@@ -826,5 +827,22 @@ describe('inherited methods', () => {
     });
     const edges = await magentoPluginEdges(built.queries, built.context, noYield);
     expect(edges.map((e) => e.source)).toEqual(['method:Acme\\Model\\Base::save']);
+  });
+});
+
+describe('sync gate for magento synthesis inputs', () => {
+  it.each([
+    ['app/code/Acme/Shop/etc/di.xml', '<config/>'],
+    ['app/design/frontend/Acme/theme/Acme_Shop/templates/title.phtml', '<?= $block->escapeHtml($block->getTitle()) ?>'],
+    ['app/code/Acme/Shop/view/frontend/templates/title.twig', '{{ block.getTitle() }}'],
+    ['app/code/Acme/Shop/view/frontend/templates/page.twig', "{% include 'Acme_Shop::title.twig' %}"],
+    ['app/code/Acme/Shop/view/frontend/web/js/cart.ts', "import Cart from 'Acme_Shop::js/cart';"],
+    ['app/code/Acme/Shop/view/frontend/web/js/lazy.js', "const Cart = () => import('Acme_Shop::js/cart');"],
+  ])('refreshes synthesis when %s changes', (filePath, content) => {
+    expect(hasSynthesisPattern(filePath, content)).toBe(true);
+  });
+
+  it('leaves a plain script with no module specifier to the other gates', () => {
+    expect(hasSynthesisPattern('src/util.ts', "import x from './x'; export const y = x;")).toBe(false);
   });
 });

@@ -28,17 +28,25 @@
  * converge on whichever the daemon bound with zero coordination.
  */
 
-import * as crypto from 'crypto';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { getCodeGraphDir } from '../directory';
+import { canonicalProjectRoot, getCodeGraphDir } from '../directory';
 
 /** Soft upper bound for in-project socket paths. */
 const POSIX_SOCKET_PATH_LIMIT = 100;
 
-/** Short stable identifier for a project root — used in tmpdir/pipe names. */
+/**
+ * Short stable identifier for a project root — used in tmpdir/pipe names.
+ *
+ * Hashed over {@link canonicalProjectRoot}, never a raw `path.resolve`: the key
+ * is a rendezvous, so every spelling of one directory must land on one name or
+ * a proxy probes a pipe the running daemon never bound (see that function).
+ */
 function projectHash(projectRoot: string): string {
-  return crypto.createHash('sha256').update(path.resolve(projectRoot)).digest('hex').slice(0, 16);
+  // `crypto` is the slowest builtin to load, and every CLI command loads this file.
+  const { createHash } = require('crypto') as typeof import('crypto');
+  return createHash('sha256').update(canonicalProjectRoot(projectRoot)).digest('hex').slice(0, 16);
 }
 
 /**
@@ -101,6 +109,65 @@ export interface DaemonLockInfo {
   startedAt: number;
 }
 
+/** Whether a lock record contains enough identity data for a socket hello. */
+export function canProbeDaemonIdentity(info: DaemonLockInfo): boolean {
+  return (
+    Number.isInteger(info.pid) &&
+    info.pid > 0 &&
+    typeof info.socketPath === 'string' &&
+    info.socketPath.length > 0
+  );
+}
+
+/**
+ * Verify that the process named by a lockfile is the CodeGraph daemon serving
+ * its socket. A bare PID liveness probe is insufficient because OSes reuse PIDs
+ * after an OOM/SIGKILL (#1553).
+ */
+export function probeDaemonIdentity(info: DaemonLockInfo, timeoutMs = 1_000): Promise<boolean> {
+  if (!canProbeDaemonIdentity(info)) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    let socket: net.Socket;
+    let buffer = '';
+    let done = false;
+    const finish = (ok: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    try {
+      socket = net.createConnection(info.socketPath);
+    } catch {
+      clearTimeout(timer);
+      resolve(false);
+      return;
+    }
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => {
+      buffer += String(chunk);
+      if (buffer.length > 4096) return finish(false);
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      try {
+        const hello = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>;
+        finish(
+          hello.protocol === 1 &&
+          hello.pid === info.pid &&
+          (info.version === 'unknown' || hello.codegraph === info.version)
+        );
+      } catch {
+        finish(false);
+      }
+    });
+    socket.on('error', () => finish(false));
+    socket.on('close', () => finish(false));
+  });
+}
+
 /**
  * Serialize a {@link DaemonLockInfo} for writing to the pidfile. JSON for
  * human readability — operators occasionally `cat` this when debugging.
@@ -128,12 +195,12 @@ export function decodeLockInfo(raw: string): DaemonLockInfo | null {
     ) {
       return parsed as DaemonLockInfo;
     }
-    return null;
   } catch {
     // Fall through to legacy plain-pid handling.
   }
+  if (!/^[1-9]\d*$/.test(trimmed)) return null;
   const pid = Number(trimmed);
-  if (Number.isFinite(pid) && pid > 0) {
+  if (Number.isSafeInteger(pid)) {
     return { pid, version: 'unknown', socketPath: '', startedAt: 0 };
   }
   return null;

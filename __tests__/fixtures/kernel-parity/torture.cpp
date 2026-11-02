@@ -39,6 +39,8 @@ class Session {
 public:
   void open();
   virtual ~Session() {}
+  // #1727 — pure virtual must mint a method node (parity between wasm + kernel).
+  virtual int read(int key) = 0;
 };
 void Session::open() {}
 }  // namespace app::net
@@ -106,6 +108,21 @@ void Widget::Tick(float Delta) { Health += Delta; }
 Config GlobalConfig;
 int build_number = 7;
 
+// class/struct/union/enum definitions in a declaration's type — nodes beside
+// the variables; an unnamed one takes its first variable's name
+void on_open() {}
+void on_close() {}
+namespace decl_types {
+/** The handler registry. */
+struct Registry {
+  int size() const { return 2; }
+  void (*handlers[2])() = {&on_open, &on_close};
+} registry;
+class Bar { void g() {} } bar, *pbar;
+static struct { int retries; } settings;
+enum { kIdle, kBusy } state;
+}  // namespace decl_types
+
 template <typename T>
 T compute_seed(T v) {
   return v + 1;
@@ -138,3 +155,51 @@ float drive() {
   (void)m;
   return r + f + flags + leg;
 }
+// A function named past its noexcept/throw/requires clauses.
+namespace clauses {
+template <template <typename, typename> class Ser>
+class Json {
+ public:
+  template <typename T, typename U = T>
+  Json(T&& val) noexcept(noexcept(Ser<U>::to_json(*this, val))) {
+    Ser<U>::to_json(*this, val);
+  }
+  void Reserve(int n) throw(std::bad_alloc) {}
+};
+template <typename T>
+T Twice(T v) requires std::integral<T> {
+  return v * 2;
+}
+}  // namespace clauses
+// Members: the types each is declared with are references from its holder, or
+// from the alias they are named through.
+namespace members {
+class Slice {};
+template <typename K, typename V> class Map {};
+using Rows = std::vector<Slice*>;
+typedef Map<int, Slice> SliceMap;
+template <class T>
+class Holder {
+ public:
+  Slice Get(const Slice& key);
+  virtual Rows* Scan(const Slice& from) = 0;
+  const Slice& Peek() const;
+ private:
+  Slice by_value;
+  const Slice& by_reference;
+  members::Slice* qualified;
+  ::members::Slice* global;
+  std::vector<Slice> items;
+  std::unique_ptr<Map<int, T>> owner;
+  Outer<T>::Inner<Slice>* nested;
+  typename T::value_type element;
+  std::function<void(Slice*)> done;
+  void (*callback)(const Slice* key, Rows rows);
+  decltype(1) computed;
+  Holder<T>* next;
+  enum class Mode : int { A, B } mode;
+  class Fwd;
+  union { Slice left; int right; };
+  struct Node { SliceMap* map; };
+};
+}  // namespace members
